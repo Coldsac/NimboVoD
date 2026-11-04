@@ -151,7 +151,7 @@ function brandWarningsOnDisk({
     if (!existsSync(bannerPath)) {
       warnings.push(
         `BRAND WARNING: this looks like a game/canvas app but ${bannerPath} is missing. `
-          + "Games need a 50:11 X feed card (1200\u00d7264 JPEG) at public/x-banner.jpg \u2014 "
+          + "Games need a 50:11 X feed card (1200×264 JPEG) at public/x-banner.jpg — "
           + `open ${skillPath} and finish the brand-asset pass.`,
       );
     } else if (statSync(bannerPath).size > MAX_CARD_BYTES) {
