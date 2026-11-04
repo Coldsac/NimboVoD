@@ -108,7 +108,7 @@ test("preview: a stored bearer is still invalidated server-side", async () => {
   assert.equal(h.requests, 1);
 });
 
-// ── Deployed ─────────────────────────────────────────────────────────────────────
+// ── Deployed ─────────────────────────────────────────────────────────────────
 // JS cannot delete the HttpOnly `__Host-` cookie and `cookieCache` keeps
 // serving the cached session, so an unconfirmed sign-out must NOT look like one.
 

@@ -27,7 +27,7 @@ async function assertSafeUrl(raw: string): Promise<string> {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Only http and https URLs are allowed.");
   }
-  const host = url.hostname.replace(/^[\[]|\]$/g, "").toLowerCase();
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (
     host === "localhost" ||
     host.endsWith(".local") ||
