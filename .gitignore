@@ -1,0 +1,14 @@
+node_modules
+dist
+.output
+.vercel
+.vinxi
+.tanstack
+*.log
+.DS_Store
+cleaner-win/target
+cleaner-win/.cargo/config.toml
+cleaner-win/python-embed.zip
+public/nimbovod-cleaner.exe
+.env
+.env.*
