@@ -33,7 +33,7 @@ Add M3U links or choose local `.m3u` files, then click **Load playlists**. The s
 
 **Emby library**
 
-Enter the server address and API key, then click **Pull library**. User id is optional. You can also upload a library export or paste titles, one per line. Episodes such as `Show S01E02` are matched as episodes.
+Enter the server address and API key, then click **Pull library**. User id is optional. You can also upload a library export or paste titles, one per line. A season already in Emby is left out. A later season that Emby does not have is added. Titles like `Show S01E02` are matched to that season. A subtitle after a colon, such as `Show: Other Name`, still matches `Show`.
 
 **Where the .strm files go**
 

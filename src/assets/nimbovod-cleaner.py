@@ -95,7 +95,7 @@ EPISODE = re.compile(
 ATTR = re.compile(r"""([A-Za-z0-9-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
 PAGE_SIZE = 400
-ITEM_LIMIT = 30000
+ITEM_LIMIT = 500_000
 
 
 def compile_extra_tags(tags: object) -> re.Pattern[str] | None:
@@ -267,16 +267,57 @@ def find_match(index: dict[str, list[dict]], key: str, year: int | None, use_yea
     return None
 
 
+def is_strm(item: dict) -> bool:
+    path = item.get("path") or item.get("Path") or ""
+    return isinstance(path, str) and path.lower().endswith(".strm")
+
+
+def show_keys(show: str, extra: re.Pattern[str] | None = None) -> list[str]:
+    """Names to try, most specific first. A subtitle after a colon is tried second."""
+    keys: list[str] = []
+
+    def add(value: str) -> None:
+        key, _year = normalize_title(value, extra)
+        if key and key not in keys:
+            keys.append(key)
+
+    add(show)
+    head = re.split(r"\s*[:|]\s*", show, maxsplit=1)[0].strip()
+    if head and head != show:
+        add(head)
+    trimmed = re.sub(r"\s+season\s+\d{1,2}\s*$", "", show, flags=re.I).strip()
+    if trimmed and trimmed != show:
+        add(trimmed)
+    return keys
+
+
+def owned_show_key(
+    show: str,
+    series: dict,
+    seasons: dict[str, set[int]],
+    extra: re.Pattern[str] | None = None,
+) -> str:
+    keys = show_keys(show, extra)
+    for key in keys:
+        if key in series or key in seasons:
+            return key
+    return keys[0] if keys else ""
+
+
 def index_library(
     items: list[dict],
     match_filenames: bool,
     extra: re.Pattern[str] | None = None,
-) -> tuple[dict, dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict, dict[str, set[int]]]:
     movies: dict[str, list[dict]] = {}
     series: dict[str, list[dict]] = {}
     episodes: dict[str, list[dict]] = {}
     filenames: dict[str, list[dict]] = {}
+    seasons: dict[str, set[int]] = {}
     for item in items:
+        # .strm files are this program's own copies. They are not the library.
+        if is_strm(item):
+            continue
         name = str(item.get("name") or item.get("Name") or "").strip()
         if not name:
             continue
@@ -296,12 +337,13 @@ def index_library(
             episode = item.get("episode", item.get("IndexNumber"))
             if show_key and isinstance(season, int) and isinstance(episode, int):
                 remember(episodes, f"{show_key}|{season}|{episode}", label, year)
+                seasons.setdefault(show_key, set()).add(season)
         path = item.get("path") or item.get("Path")
         if match_filenames and isinstance(path, str) and path.strip():
             base = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", path.replace("\\", "/").split("/")[-1])
             file_key, file_year = normalize_title(base, extra)
             remember(filenames, file_key, label, year if isinstance(year, int) else file_year)
-    return movies, series, episodes, filenames
+    return movies, series, episodes, filenames, seasons
 
 
 def disk_duplicate_rows(folder: Path, planned: list[dict]) -> list[dict]:
@@ -356,8 +398,10 @@ def disk_duplicate_rows(folder: Path, planned: list[dict]) -> list[dict]:
 def plan_entries(entries: list[dict], library: list[dict] | None, options: dict) -> list[dict]:
     extra = compile_extra_tags(options.get("extra_tags"))
     drop_duplicate_strm = bool(options.get("drop_duplicate_strm", True))
-    movies, series, episodes, filenames = (
-        index_library(library, options["match_filenames"], extra) if library is not None else ({}, {}, {}, {})
+    movies, series, episodes, filenames, seasons = (
+        index_library(library, options["match_filenames"], extra)
+        if library is not None
+        else ({}, {}, {}, {}, {})
     )
     used: set[str] = set()
     seen: set[str] = set()
@@ -389,10 +433,14 @@ def plan_entries(entries: list[dict], library: list[dict] | None, options: dict)
         reason = ""
         if episode:
             show, season, number, _rest = episode
-            show_key, _year = normalize_title(show, extra)
+            show_key = owned_show_key(show, series, seasons, extra)
             hit = (episodes.get(f"{show_key}|{season}|{number}") or [None])[0]
             if hit:
                 reason = f"Already in Emby · {hit['label']}"
+            elif season in seasons.get(show_key, set()):
+                # One episode of a season means that season is already in the library.
+                label = (series.get(show_key) or [{"label": show}])[0]["label"]
+                reason = f"Already in Emby · Season {season} · {label}"
         else:
             key, year = normalize_title(cleaned, extra)
             hit = (
@@ -516,7 +564,7 @@ def request_json(url: str, api_key: str) -> dict:
     return payload
 
 
-def fetch_emby(base_url: str, api_key: str, user_id: str) -> list[dict]:
+def fetch_emby(base_url: str, api_key: str, user_id: str, on_progress=None) -> list[dict]:
     origin = base_url.rstrip("/")
     origin = re.sub(r"/web(/index\.html?)?$", "", origin, flags=re.I)
     origin = re.sub(r"/emby$", "", origin, flags=re.I)
@@ -527,6 +575,18 @@ def fetch_emby(base_url: str, api_key: str, user_id: str) -> list[dict]:
             start = 0
             items: list[dict] = []
             total = None
+            reported = 0.0
+
+            def report(done: int, total_count: int | None, force: bool = False) -> None:
+                nonlocal reported
+                if on_progress is None:
+                    return
+                now = time.time()
+                if not force and now - reported < 0.25:
+                    return
+                reported = now
+                on_progress(done, total_count)
+
             while len(items) < ITEM_LIMIT:
                 query = urllib.parse.urlencode(
                     {
@@ -561,7 +621,9 @@ def fetch_emby(base_url: str, api_key: str, user_id: str) -> list[dict]:
                 start += len(batch)
                 if isinstance(payload.get("TotalRecordCount"), int):
                     total = payload["TotalRecordCount"]
-                if len(batch) < PAGE_SIZE or (total is not None and start >= total):
+                finished = len(batch) < PAGE_SIZE or (total is not None and start >= total) or len(items) >= ITEM_LIMIT
+                report(len(items), total, force=finished)
+                if finished:
                     break
             return items
         except urllib.error.HTTPError as error:
@@ -797,6 +859,61 @@ def self_test() -> None:
     )
     assert tagged_plan[0]["path"] == "The Matrix.strm", tagged_plan[0]
     assert tagged_plan[0]["disposition"] == "drop", tagged_plan[0]
+    shows = parse_m3u(
+        "#EXTM3U\n"
+        '#EXTINF:-1 group-title="The Office",The Office S01E01\nhttps://example.com/e1\n'
+        '#EXTINF:-1 group-title="The Office",The Office S01E03\nhttps://example.com/e3\n'
+        '#EXTINF:-1 group-title="The Office",The Office S02E01\nhttps://example.com/e4\n'
+        '#EXTINF:-1 group-title="The Agency: Central Intelligence",The Agency: Central Intelligence S01E05\nhttps://example.com/a1\n'
+        '#EXTINF:-1 group-title="The Agency: Central Intelligence",The Agency: Central Intelligence S02E01\nhttps://example.com/a2\n'
+        '#EXTINF:-1 group-title="The Agency: Unfiltered",The Agency: Unfiltered S02E01\nhttps://example.com/u2\n'
+        '#EXTINF:-1 group-title="TV VOD",Brand New Show S01E01\nhttps://example.com/new\n'
+    )
+    show_plan = plan_entries(
+        shows,
+        [
+            {"name": "The Office", "year": 2005, "type": "Series"},
+            {
+                "name": "Pilot",
+                "year": 2005,
+                "type": "Episode",
+                "seriesName": "The Office",
+                "season": 1,
+                "episode": 1,
+                "path": "Z:/TV/The Office/Season 1/Pilot.mkv",
+            },
+            {"name": "The Agency (2024)", "year": 2024, "type": "Series"},
+            {
+                "name": "The Bends",
+                "year": 2024,
+                "type": "Episode",
+                "seriesName": "The Agency (2024)",
+                "season": 1,
+                "episode": 1,
+                "path": "Z:/TV/The Agency (2024)/Season 1/The Bends.mkv",
+            },
+            {
+                "name": "Kick the Wasp's Nest",
+                "year": 2025,
+                "type": "Episode",
+                "seriesName": "The Agency (2024)",
+                "season": 2,
+                "episode": 1,
+                "path": "D:/NimiboVoD/The Agency Central Intelligence/Season 02/S02E01.strm",
+            },
+            {"name": "The Agency: Unfiltered", "type": "Series"},
+        ],
+        {"layout": "library", "strip_quality": True, "use_years": True, "match_filenames": True},
+    )
+    show_by_title = {row["title"]: row for row in show_plan}
+    assert show_by_title["The Office S01E01"]["disposition"] == "drop"
+    assert show_by_title["The Office S01E03"]["disposition"] == "drop"
+    assert "Season 1" in show_by_title["The Office S01E03"]["reason"]
+    assert show_by_title["The Office S02E01"]["disposition"] == "keep"
+    assert show_by_title["The Agency: Central Intelligence S01E05"]["disposition"] == "drop"
+    assert show_by_title["The Agency: Central Intelligence S02E01"]["disposition"] == "keep"
+    assert show_by_title["The Agency: Unfiltered S02E01"]["disposition"] == "keep"
+    assert show_by_title["Brand New Show S01E01"]["disposition"] == "keep"
     assert strip_quality("Movie [WEB] [x265] [x264] [TS] Megusta [ ]") == "Movie"
     assert strip_quality("Movie [1080p]") == "Movie"
     assert normalize_title("Movie Megusta")[0] == "movie"

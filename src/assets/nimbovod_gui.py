@@ -929,7 +929,7 @@ class App(tk.Tk):
         ttk.Label(emby, text="Or paste titles", style="Card.TLabel").pack(anchor="w")
         ttk.Label(
             emby,
-            text="One per line. Episodes like Show S01E02 are matched as episodes.",
+            text="One per line. A season already in Emby is left out. A later season that Emby does not have is added. Titles like Show S01E02 are matched to that season.",
             style="CardMuted.TLabel",
             wraplength=400,
         ).pack(anchor="w", pady=(0, 4))
@@ -1319,7 +1319,9 @@ class App(tk.Tk):
                     self._call_on_ui(lambda message=message: self._set_error(message))
                 else:
                     try:
-                        items = self.cleaner.fetch_emby(snapshot["emby"], snapshot["api_key"], snapshot["user_id"])
+                        items = self.cleaner.fetch_emby(
+                            snapshot["emby"], snapshot["api_key"], snapshot["user_id"], self._emby_progress
+                        )
                     except BaseException as exc:
                         emby_ok = False
                         message = explain(exc)
@@ -1334,7 +1336,7 @@ class App(tk.Tk):
 
                             def apply_emby(items=items, note=note) -> None:
                                 self.library = items
-                                suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
+                                suffix = self._library_limit_suffix(len(items))
                                 self.library_label = f"Emby · {len(items):,} items{suffix}"
                                 self._show_library()
                                 self._auto_note = note
@@ -1578,6 +1580,17 @@ class App(tk.Tk):
         for source in self.sources:
             self.source_list.insert("end", f"{source['label']}  ({len(source['entries']):,})")
 
+    def _library_limit_suffix(self, count: int) -> str:
+        if count >= self.cleaner.ITEM_LIMIT:
+            return f" (stopped at {self.cleaner.ITEM_LIMIT:,})"
+        return ""
+
+    def _emby_progress(self, done: int, total: int | None) -> None:
+        if total:
+            self._post_status(f"Reading Emby library… {done:,} of {total:,}")
+        else:
+            self._post_status(f"Reading Emby library… {done:,}")
+
     def _show_library(self) -> None:
         if self.library is None:
             self.library_status.set("No library loaded. Every stream will be kept.")
@@ -1787,7 +1800,7 @@ class App(tk.Tk):
             return
 
         def work():
-            return self.cleaner.fetch_emby(base, key, user)
+            return self.cleaner.fetch_emby(base, key, user, self._emby_progress)
 
         def done(items) -> None:
             if not items:
@@ -1795,7 +1808,7 @@ class App(tk.Tk):
                 self.status.set("Ready")
                 return
             self.library = items
-            suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
+            suffix = self._library_limit_suffix(len(items))
             self.library_label = f"Emby · {len(items):,} items{suffix}"
             self._show_library()
             self.build_plan()
@@ -1867,7 +1880,7 @@ class App(tk.Tk):
         self.query.set("")
         self.build_plan()
         self._set_error("")
-        self.status.set("Sample loaded. Dune (1984) and The Office S01E03 stay. The Matrix (1999) is left out.")
+        self.status.set("Sample loaded. Dune (1984) stays. The Matrix (1999) and The Office are left out.")
 
     def _plan_options(self) -> dict:
         layout = self.layout.get()
@@ -2217,7 +2230,8 @@ def self_check() -> None:
     assert by_title["Dune (1984)"] == ["keep"]
     assert by_title["Dune (2021)"] == ["drop"]
     assert by_title["The Office S01E01"] == ["drop"]
-    assert by_title["The Office S01E03"] == ["keep"]
+    assert by_title["The Office S01E03"] == ["drop"]
+    assert by_title["Severance S01E02"] == ["drop"]
     assert by_title["Blade Runner 2049"] == ["keep"]
     assert by_title["City News"] == ["keep"]
     tagged = cleaner.parse_m3u(
@@ -2344,7 +2358,7 @@ def self_check() -> None:
             active["name"] = ""
             return SAMPLE_PLAYLIST
 
-        def fetch_emby(_base: str, _key: str, _user: str) -> list[dict]:
+        def fetch_emby(_base: str, _key: str, _user: str, on_progress=None) -> list[dict]:
             if active["name"]:
                 problems.append(f"emby overlapped {active['name']}")
             if order != ["playlist", "playlist"]:
