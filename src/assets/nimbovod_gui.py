@@ -1411,20 +1411,34 @@ class App(tk.Tk):
         for path in files:
             number += 1
             current = number
-            self._call_on_ui(lambda current=current, total=total: self.status.set(f"Updating playlist {current} of {total}…"))
+            label = Path(path).name
+            self._post_status(f"Updating playlist {current} of {total}… {label}")
             try:
-                loaded.append(self._read_source(path, "file"))
+                loaded.append(self._read_source(path, "file", on_progress=self._playlist_progress(current, total, label)))
             except BaseException as exc:
-                failures.append(f"{Path(path).name}: {explain(exc)}")
+                failures.append(f"{label}: {explain(exc)}")
         for url in urls:
             number += 1
             current = number
-            self._call_on_ui(lambda current=current, total=total: self.status.set(f"Updating playlist {current} of {total}…"))
+            label = playlist_label(url)
+            self._post_status(f"Updating playlist {current} of {total}… {label}")
             try:
-                loaded.append(self._read_source(url, "url"))
+                loaded.append(self._read_source(url, "url", on_progress=self._playlist_progress(current, total, label)))
             except BaseException as exc:
-                failures.append(f"{playlist_label(url)}: {explain(exc)}")
+                failures.append(f"{label}: {explain(exc)}")
         return loaded, failures, total
+
+    def _playlist_progress(self, current: int, total: int, label: str):
+        last = {"at": 0.0}
+
+        def progress(nbytes: int, current: int = current, total: int = total, label: str = label) -> None:
+            now = time.time()
+            if now - last["at"] < 0.25:
+                return
+            last["at"] = now
+            self._post_status(f"Updating playlist {current} of {total}… {label} · {nbytes / 1048576:.1f} MB")
+
+        return progress
 
     def _plan_snapshot(self, options: dict) -> list[dict]:
         copied = self._call_on_ui(
@@ -1439,6 +1453,9 @@ class App(tk.Tk):
         entries = [entry for source in sources for entry in source["entries"]]
         if not entries:
             return []
+        return self._entries_plan(entries, library, options)
+
+    def _entries_plan(self, entries: list[dict], library: list[dict] | None, options: dict) -> list[dict]:
         planned = self.cleaner.plan_entries(entries, library, options)
         for entry, row in zip(entries, planned):
             row["group"] = entry.get("group") or ""
@@ -1592,18 +1609,53 @@ class App(tk.Tk):
         self._refresh_links()
         self._save_settings()
 
-    def _read_source(self, source: str, kind: str) -> dict:
+    def _post_status(self, text: str) -> None:
+        """Update the status line without waiting. Safe to call from a worker."""
+        if threading.current_thread() is self._ui_thread:
+            if self.winfo_exists():
+                self.status.set(text)
+            return
+        if self._ui_calls.qsize() > 8:
+            return
+
+        def apply(text: str = text) -> None:
+            if self.winfo_exists():
+                self.status.set(text)
+
+        self._ui_calls.put(apply)
+
+    def _read_local_playlist(self, source: str) -> tuple[str, str, str]:
+        outcome: dict = {}
+
+        def work() -> None:
+            try:
+                path = Path(source)
+                if not path.is_file():
+                    raise ValueError(f"Cannot find {source}")
+                if path.stat().st_size > MAX_PLAYLIST_BYTES:
+                    raise ValueError(f"{path.name} is over 80 MB.")
+                outcome["text"] = path.read_text(encoding="utf-8", errors="replace")
+                outcome["label"] = path.name
+                outcome["path"] = str(path.resolve())
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        thread.join(30)
+        if thread.is_alive():
+            raise TimeoutError(f"{Path(source).name} took too long.")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["text"], outcome["label"], outcome["path"]
+
+    def _read_source(self, source: str, kind: str, on_progress=None) -> dict:
+        saved_path = ""
         if source.startswith("http://") or source.startswith("https://"):
-            text = self.cleaner.fetch_text(source)
+            text = self.cleaner.fetch_text(source, on_progress=on_progress)
             label = playlist_label(source)
         else:
-            path = Path(source)
-            if not path.is_file():
-                raise ValueError(f"Cannot find {source}")
-            if path.stat().st_size > MAX_PLAYLIST_BYTES:
-                raise ValueError(f"{path.name} is over 80 MB.")
-            text = path.read_text(encoding="utf-8", errors="replace")
-            label = path.name
+            text, label, saved_path = self._read_local_playlist(source)
         if not looks_like_playlist(text):
             raise ValueError("not an M3U playlist")
         entries = self.cleaner.parse_m3u(text)
@@ -1611,7 +1663,7 @@ class App(tk.Tk):
             raise ValueError("no streams found")
         payload = {"kind": kind, "label": label, "entries": entries}
         if kind == "file":
-            payload["path"] = str(Path(source).resolve())
+            payload["path"] = saved_path
         return payload
 
     def _remember_playlist_file(self, path: str) -> None:
@@ -1665,20 +1717,38 @@ class App(tk.Tk):
         if not urls:
             self._set_error("Add at least one playlist link.")
             return
+        options = self._plan_options()
+        library = None if self.library is None else list(self.library)
+        total = len(urls)
 
         def work():
             loaded = []
             failures = []
             for index, url in enumerate(urls, start=1):
-                self.after(0, lambda index=index, total=len(urls): self.status.set(f"Loading playlist {index} of {total}…"))
+                label = playlist_label(url)
+                self._post_status(f"Loading playlist {index} of {total}… {label}")
+                last = {"at": 0.0}
+
+                def progress(nbytes: int, index: int = index, total: int = total, label: str = label) -> None:
+                    now = time.time()
+                    if now - last["at"] < 0.25:
+                        return
+                    last["at"] = now
+                    self._post_status(f"Loading playlist {index} of {total}… {label} · {nbytes / 1048576:.1f} MB")
+
                 try:
-                    loaded.append(self._read_source(url, "url"))
+                    loaded.append(self._read_source(url, "url", on_progress=progress))
                 except BaseException as exc:
-                    failures.append(f"{playlist_label(url)}: {explain(exc)}")
-            return loaded, failures
+                    failures.append(f"{label}: {explain(exc)}")
+            entries = [entry for source in loaded for entry in source["entries"]]
+            planned: list[dict] = []
+            if entries:
+                self._post_status("Checking playlists…")
+                planned = self._entries_plan(entries, library, options)
+            return loaded, failures, planned
 
         def done(result) -> None:
-            loaded, failures = result
+            loaded, failures, planned = result
             if not loaded:
                 self._set_error(" ".join(failures) or "No playlists could be loaded.")
                 self.status.set("Ready")
@@ -1686,14 +1756,14 @@ class App(tk.Tk):
             files = [source for source in self.sources if source["kind"] == "file"]
             self.sources = files + loaded
             self._refresh_sources()
-            self.build_plan()
+            self._show_planned(planned)
             if failures:
-                self._set_error(f"Loaded {len(loaded)} of {len(urls)}. " + " ".join(failures))
+                self._set_error(f"Loaded {len(loaded)} of {total}. " + " ".join(failures))
             else:
                 self._set_error("")
             self.status.set(f"Loaded {len(loaded)} playlist link{'s' if len(loaded) != 1 else ''}.")
 
-        self._run("Loading playlists…", work, done)
+        self._run(f"Loading playlist 1 of {total}…", work, done)
 
     def remove_source(self) -> None:
         selected = list(self.source_list.curselection())
@@ -2230,7 +2300,7 @@ def self_check() -> None:
         active = {"name": ""}
         problems: list[str] = []
 
-        def fetch_text(url: str) -> str:
+        def fetch_text(url: str, on_progress=None) -> str:
             if active["name"]:
                 problems.append(f"playlist overlapped {active['name']}")
             active["name"] = "playlist"

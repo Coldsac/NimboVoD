@@ -24,6 +24,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -306,20 +307,35 @@ def disk_duplicate_rows(folder: Path, planned: list[dict]) -> list[dict]:
     if not directory_reachable(folder):
         return []
     known = {row["path"].replace("\\", "/").lower() for row in planned}
-    found: list[dict] = []
+    kept_names: dict[str, set[str]] = {}
     for row in planned:
         if row["disposition"] != "keep":
             continue
         relative = Path(row["path"].replace("\\", "/"))
-        parent = folder / relative.parent
-        if not parent.is_dir():
-            continue
-        pattern = re.compile(rf"^{re.escape(relative.stem)} \((\d+)\){re.escape(relative.suffix)}$", re.I)
-        for child in parent.iterdir():
-            match = pattern.match(child.name)
-            if not child.is_file() or match is None or int(match.group(1)) < 2:
+        kept_names.setdefault(relative.parent.as_posix(), set()).add(relative.name.lower())
+    found: list[dict] = []
+    numbered = re.compile(r"^(?P<stem>.+) \((?P<number>\d+)\)(?P<suffix>\.[^.]+)$", re.I)
+    for parent_key, names in kept_names.items():
+        parent = folder if parent_key == "." else folder / parent_key
+        try:
+            if not parent.is_dir():
                 continue
-            sibling = (relative.parent / child.name).as_posix()
+            children = list(parent.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            match = numbered.match(child.name)
+            if match is None or int(match.group("number")) < 2:
+                continue
+            try:
+                if not child.is_file():
+                    continue
+            except OSError:
+                continue
+            plain = f"{match.group('stem')}{match.group('suffix')}"
+            if plain.lower() not in names:
+                continue
+            sibling = child.name if parent_key == "." else f"{parent_key}/{child.name}"
             if sibling.lower() in known:
                 continue
             known.add(sibling.lower())
@@ -422,13 +438,49 @@ def name_resolves(host: str, timeout: float = 3.0) -> bool:
     return bool(outcome.get("ok"))
 
 
-def read_response(request: urllib.request.Request, timeout: int = 60) -> bytes:
-    """Read a response. A stuck name lookup ends; a running download does not."""
+def read_response(
+    request: urllib.request.Request,
+    timeout: int = 20,
+    limit_seconds: int = 120,
+    max_bytes: int = 80 * 1024 * 1024,
+    on_progress=None,
+) -> bytes:
+    """Read a response. A stalled connection ends, and progress can be reported."""
     host = urllib.parse.urlparse(request.full_url).hostname or ""
     if host and not name_resolves(host, 3):
         raise SystemExit("The connection took too long.")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read()
+    outcome: dict = {}
+
+    def work() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                chunks: list[bytes] = []
+                total = 0
+                started = time.time()
+                while True:
+                    if time.time() - started > limit_seconds:
+                        raise SystemExit("The connection took too long.")
+                    block = response.read(64 * 1024)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > max_bytes:
+                        raise SystemExit("The download is over 80 MB.")
+                    chunks.append(block)
+                    if on_progress is not None:
+                        on_progress(total)
+                outcome["body"] = b"".join(chunks)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(limit_seconds + 5)
+    if thread.is_alive():
+        raise SystemExit("The connection took too long.")
+    if "error" in outcome:
+        raise outcome["error"]
+    body = outcome.get("body")
     if not isinstance(body, bytes):
         raise SystemExit("The connection took too long.")
     return body
@@ -522,12 +574,12 @@ def fetch_emby(base_url: str, api_key: str, user_id: str) -> list[dict]:
     raise SystemExit(last_error)
 
 
-def fetch_text(url: str) -> str:
+def fetch_text(url: str, on_progress=None) -> str:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise SystemExit("The playlist URL must start with http or https.")
     request = urllib.request.Request(url, headers={"User-Agent": "NimboVoD/1.0"})
-    return read_response(request).decode("utf-8", errors="replace")
+    return read_response(request, on_progress=on_progress).decode("utf-8", errors="replace")
 
 
 def inside(root: Path, relative: str) -> Path:
