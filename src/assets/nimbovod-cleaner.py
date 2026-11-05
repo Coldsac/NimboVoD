@@ -21,7 +21,9 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -301,7 +303,7 @@ def index_library(
 
 
 def disk_duplicate_rows(folder: Path, planned: list[dict]) -> list[dict]:
-    if not folder.is_dir():
+    if not directory_reachable(folder):
         return []
     known = {row["path"].replace("\\", "/").lower() for row in planned}
     found: list[dict] = []
@@ -398,13 +400,64 @@ def plan_entries(entries: list[dict], library: list[dict] | None, options: dict)
     return planned
 
 
+def name_resolves(host: str, timeout: float = 3.0) -> bool:
+    """Name lookup with a limit. urllib's timeout does not cover this wait."""
+    if not host.strip():
+        return False
+    done = threading.Event()
+    outcome: dict[str, bool] = {}
+
+    def work() -> None:
+        try:
+            socket.getaddrinfo(host, None)
+            outcome["ok"] = True
+        except OSError:
+            outcome["ok"] = False
+        finally:
+            done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    if not done.wait(timeout):
+        return False
+    return bool(outcome.get("ok"))
+
+
+def read_response(request: urllib.request.Request, timeout: int = 60) -> bytes:
+    """Read a response. A stuck name lookup ends; a running download does not."""
+    host = urllib.parse.urlparse(request.full_url).hostname or ""
+    if host and not name_resolves(host, 3):
+        raise SystemExit("The connection took too long.")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read()
+    if not isinstance(body, bytes):
+        raise SystemExit("The connection took too long.")
+    return body
+
+
+def directory_reachable(path: Path, timeout: float = 2.0) -> bool:
+    """Return whether a folder answers quickly. A disconnected drive does not."""
+    if not str(path).strip():
+        return False
+    outcome: dict[str, bool] = {}
+
+    def check() -> None:
+        try:
+            outcome["ok"] = path.is_dir()
+        except OSError:
+            outcome["ok"] = False
+
+    thread = threading.Thread(target=check, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return bool(outcome.get("ok"))
+
+
 def request_json(url: str, api_key: str) -> dict:
     request = urllib.request.Request(
         url,
         headers={"X-Emby-Token": api_key, "Accept": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = json.loads(read_response(request).decode("utf-8"))
     if not isinstance(payload, dict):
         raise SystemExit("Emby did not return a library list.")
     return payload
@@ -474,8 +527,7 @@ def fetch_text(url: str) -> str:
     if parsed.scheme not in {"http", "https"}:
         raise SystemExit("The playlist URL must start with http or https.")
     request = urllib.request.Request(url, headers={"User-Agent": "NimboVoD/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read().decode("utf-8", errors="replace")
+    return read_response(request).decode("utf-8", errors="replace")
 
 
 def inside(root: Path, relative: str) -> Path:
@@ -675,6 +727,9 @@ def self_test() -> None:
             {"layout": "flat", "strip_quality": True, "drop_duplicate_strm": True, "out": directory},
         )
         assert any(row["path"] == "Movie (2).strm" and row["disposition"] == "drop" for row in with_disk)
+        assert directory_reachable(folder)
+        assert not directory_reachable(folder / "missing")
+        assert name_resolves("localhost", 2)
     print("self-test ok")
 
 

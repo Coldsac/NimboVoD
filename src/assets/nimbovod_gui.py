@@ -11,8 +11,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import sys
 import threading
+import time
 import tkinter as tk
 # The cleaner is loaded from a separate file, so PyInstaller only sees imports made here.
 import urllib.error
@@ -220,6 +222,27 @@ def auto_steps(pull_playlists: bool, pull_emby: bool, apply_strm: bool) -> list[
     if apply_strm:
         steps.append("apply")
     return steps
+
+
+def host_resolves(host: str, timeout: float = 3.0) -> bool:
+    """Name lookup with a limit. The normal lookup can stall right after a restart."""
+    if not host.strip():
+        return False
+    done = threading.Event()
+    outcome: dict[str, bool] = {}
+
+    def work() -> None:
+        try:
+            socket.getaddrinfo(host, None)
+            outcome["ok"] = True
+        except OSError:
+            outcome["ok"] = False
+        done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    if not done.wait(timeout):
+        return False
+    return bool(outcome.get("ok"))
 
 
 def refresh_minutes(value: str) -> int:
@@ -721,25 +744,33 @@ class App(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         inner = ttk.Frame(canvas)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        fitted = {"width": 0, "region": None}
+        fitted = {"width": 0, "region": None, "job": None, "busy": False}
 
-        def _fit_width(event: tk.Event) -> None:
-            if event.widget is not canvas or event.width <= 1 or event.width == fitted["width"]:
-                return
-            fitted["width"] = event.width
-            canvas.itemconfigure(window, width=event.width)
+        def _schedule_fit(_event: tk.Event | None = None) -> None:
+            if fitted["job"] is None:
+                fitted["job"] = canvas.after_idle(_apply_fit)
 
-        def _fit_scroll(event: tk.Event) -> None:
-            if event.widget is not inner:
+        def _apply_fit() -> None:
+            fitted["job"] = None
+            if fitted["busy"] or not canvas.winfo_exists():
                 return
-            bbox = canvas.bbox("all")
-            if not bbox or bbox == fitted["region"]:
+            width = canvas.winfo_width()
+            if width <= 1:
                 return
-            fitted["region"] = bbox
-            canvas.configure(scrollregion=bbox)
+            fitted["busy"] = True
+            try:
+                if width != fitted["width"]:
+                    fitted["width"] = width
+                    canvas.itemconfigure(window, width=width)
+                bbox = canvas.bbox("all")
+                if bbox and bbox != fitted["region"]:
+                    fitted["region"] = bbox
+                    canvas.configure(scrollregion=bbox)
+            finally:
+                fitted["busy"] = False
 
-        inner.bind("<Configure>", _fit_scroll)
-        canvas.bind("<Configure>", _fit_width)
+        inner.bind("<Configure>", _schedule_fit)
+        canvas.bind("<Configure>", _schedule_fit)
         canvas.bind("<MouseWheel>", self._wheel_form)
         self.form_canvas = canvas
         self.form_inner = inner
@@ -1144,12 +1175,65 @@ class App(tk.Tk):
     def _startup_auto(self) -> None:
         if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
             return
-        self._auto_note = ""
-        self._auto_queue = auto_steps(
+        # Paint the window before refreshing. A restart can launch NimboVoD
+        # before the network is up, and a pull at that moment looks frozen.
+        self.after(1200, self._begin_startup_auto)
+
+    def _begin_startup_auto(self) -> None:
+        if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
+            return
+        if not self.winfo_exists() or self._busy or self._auto_queue:
+            return
+        steps = auto_steps(
             bool(self.auto_pull_playlists.get()),
             bool(self.auto_pull_emby.get()),
             bool(self.auto_apply_strm.get()),
         )
+        if not steps:
+            self._schedule_refresh()
+            return
+        hosts = self._refresh_hosts(steps)
+        if not hosts:
+            self._start_auto_steps(steps)
+            return
+        self.status.set("Waiting for the network…")
+        threading.Thread(target=self._wait_for_network, args=(hosts, steps), daemon=True).start()
+
+    def _refresh_hosts(self, steps: list[str]) -> list[str]:
+        hosts: list[str] = []
+        if "playlists" in steps:
+            for link in self.links:
+                host = urlparse(link.strip()).hostname
+                if host and host not in hosts:
+                    hosts.append(host)
+        if "emby" in steps:
+            host = urlparse(self.emby.get().strip()).hostname
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    def _wait_for_network(self, hosts: list[str], steps: list[str]) -> None:
+        ready = False
+        for _attempt in range(12):
+            if not self.winfo_exists():
+                return
+            if all(host_resolves(host, 3) for host in hosts):
+                ready = True
+                break
+            time.sleep(5)
+
+        def start() -> None:
+            if not self.winfo_exists() or self._busy or self._auto_queue:
+                return
+            if not ready:
+                self.status.set("Network is not ready. Trying the refresh anyway…")
+            self._start_auto_steps(steps)
+
+        self.after(0, start)
+
+    def _start_auto_steps(self, steps: list[str]) -> None:
+        self._auto_note = ""
+        self._auto_queue = list(steps)
         self._run_auto_next()
 
     def _run_auto_next(self) -> None:
@@ -1241,6 +1325,7 @@ class App(tk.Tk):
         self._set_busy(False)
         self._set_error(message)
         self.status.set("Ready")
+        self._after_auto_step()
 
     def _finish_ok(self, done, result) -> None:
         try:
@@ -1483,21 +1568,32 @@ class App(tk.Tk):
         if self.auto_pull_emby.get() and self.library is None:
             self._set_error("The Emby library was not loaded, so the .strm folder was not changed.")
             self.status.set("Ready")
+            self._after_auto_step()
             return
         if not self.planned:
             self._set_error("No playlist is loaded, so the .strm folder was not changed.")
             self.status.set("Ready")
+            self._after_auto_step()
             return
         try:
             folder = self._out_path()
             if folder is None:
+                self.status.set("Ready")
+                self._after_auto_step()
                 return
             removed = self._removal_count(folder)
         except BaseException as exc:
             self._set_error(explain(exc))
             self.status.set("Ready")
+            self._after_auto_step()
             return
         self._start_write(folder, removed, then_auto=True)
+
+    def _after_auto_step(self) -> None:
+        if self._auto_queue:
+            self._continue_auto()
+        else:
+            self._schedule_refresh()
 
     def remove_source(self) -> None:
         selected = list(self.source_list.curselection())
@@ -1710,6 +1806,8 @@ class App(tk.Tk):
         return f"{len(self.sources)} playlists"
 
     def _removal_count(self, folder: Path) -> int:
+        if not self.cleaner.directory_reachable(folder):
+            return 0
         removed = 0
         for row in self.planned:
             if row["disposition"] == "keep":
@@ -1942,6 +2040,7 @@ def self_check() -> None:
     assert refresh_minutes("15") == 15
     assert refresh_minutes("abc") == 0
     assert refresh_minutes("999999") == 10080
+    assert host_resolves("localhost", 2)
     handle = tempfile.NamedTemporaryFile(prefix="nimbovod-settings-", suffix=".json", delete=False)
     handle.close()
     os.environ["NIMBOVOD_SETTINGS"] = handle.name
