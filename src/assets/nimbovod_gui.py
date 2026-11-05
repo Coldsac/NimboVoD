@@ -124,8 +124,10 @@ def use_dark_titlebar(widget: tk.Misc) -> None:
     try:
         import ctypes
 
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetAncestor(int(widget.winfo_id()), 2)
+        user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+        child = int(widget.winfo_id())
+        parent = int(user32.GetParent(child) or 0)
+        hwnd = parent if window_class(parent) == "TkTopLevel" else int(user32.GetAncestor(child, 2) or 0)
         if not hwnd:
             return
         value = ctypes.c_int(1)
@@ -187,6 +189,12 @@ def _prepare_tray_apis():
     lresult = ctypes.c_ssize_t
     user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     user32.GetAncestor.restype = wintypes.HWND
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
     user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     user32.SetWindowLongPtrW.restype = ctypes.c_void_p
     user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
@@ -240,6 +248,17 @@ def _prepare_tray_apis():
     shell32.Shell_NotifyIconW.restype = wintypes.BOOL
     _TRAY_APIS = (user32, shell32, gdi32, lresult)
     return _TRAY_APIS
+
+
+def window_class(hwnd: int) -> str:
+    if sys.platform != "win32" or not hwnd:
+        return ""
+    import ctypes
+
+    user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+    buffer = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buffer, 256)
+    return buffer.value
 
 
 def create_tray_icon(size: int = 32):
@@ -691,6 +710,7 @@ class App(tk.Tk):
         self._tray_icon = None
         self._tray_icon_owned = False
         self._plan_hidden_for_tray = False
+        self._tray_hook_tries = 0
         self.title("NimboVoD")
         self.geometry("560x800")
         self.minsize(480, 640)
@@ -928,6 +948,8 @@ class App(tk.Tk):
         self.form_host.pack(fill="both", expand=True, padx=18, pady=(2, 12))
         self._build_form()
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Map>", self._on_map, add="+")
+        self.bind("<Unmap>", self._on_unmap, add="+")
         self.after_idle(lambda: use_dark_titlebar(self))
         self.after_idle(self._install_tray_hook)
 
@@ -2608,29 +2630,73 @@ class App(tk.Tk):
         self._unhook_window()
         super().destroy()
 
-    def _install_tray_hook(self) -> None:
-        if sys.platform != "win32" or self._tray_proc is not None:
+    def _frame_hwnd(self) -> int:
+        """Return the outer window that owns the minimize button.
+
+        Tk creates that TkTopLevel wrapper when the window is first shown.
+        Before then, winfo_id() is only the inner TkChild.
+        """
+        user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+        child = int(self.winfo_id())
+        parent = int(user32.GetParent(child) or 0)
+        if window_class(parent) == "TkTopLevel":
+            return parent
+        return 0
+
+    def _schedule_tray_hook(self) -> None:
+        if self._tray_hook_tries >= 40:
             return
+        self._tray_hook_tries += 1
+        self.after(50, self._install_tray_hook)
+
+    def _on_map(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self._install_tray_hook()
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if event.widget is not self or self._in_tray:
+            return
+        try:
+            iconic = self.state() == "iconic"
+        except tk.TclError:
+            return
+        if iconic:
+            self.after(0, self._minimize_to_tray)
+
+    def _install_tray_hook(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            frame = self._frame_hwnd()
+        except Exception:
+            frame = 0
+        if not frame:
+            self._schedule_tray_hook()
+            return
+        if self._tray_hwnd == frame and self._tray_proc is not None:
+            return
+        if self._tray_proc is not None:
+            self._unhook_window()
         try:
             import ctypes
 
             user32, _shell32, _gdi32, lresult = _prepare_tray_apis()
-            self.update_idletasks()
-            hwnd = user32.GetAncestor(int(self.winfo_id()), 2) or int(self.winfo_id())
-            if not hwnd:
-                return
             wndproc = ctypes.WINFUNCTYPE(lresult, ctypes.wintypes.HWND, ctypes.wintypes.UINT, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
             # Windows keeps this pointer. It has to stay referenced for the life of the window.
             self._tray_proc = wndproc(self._wndproc)
-            previous = user32.SetWindowLongPtrW(hwnd, -4, ctypes.cast(self._tray_proc, ctypes.c_void_p))
+            previous = user32.SetWindowLongPtrW(frame, -4, ctypes.cast(self._tray_proc, ctypes.c_void_p))
             if not previous:
                 self._tray_proc = None
+                self._schedule_tray_hook()
                 return
-            self._tray_hwnd = hwnd
+            self._tray_hwnd = frame
             self._old_wndproc = previous
+            self._tray_hook_tries = 0
+            use_dark_titlebar(self)
         except Exception:
             self._tray_proc = None
             self._old_wndproc = None
+            self._schedule_tray_hook()
 
     def _unhook_window(self) -> None:
         if self._tray_proc is None or not self._tray_hwnd or not self._old_wndproc:
@@ -2960,8 +3026,11 @@ def self_check() -> None:
         app.load_sample()
         app.show_plan()
         app.update()
+        app.deiconify()
+        app.update()
         app._install_tray_hook()
-        assert app._tray_proc is not None and app._tray_hwnd
+        assert window_class(app._tray_hwnd) == "TkTopLevel", window_class(app._tray_hwnd)
+        assert int(app._tray_hwnd) != int(app.winfo_id())
         assert is_minimize_command(WM_SYSCOMMAND, SC_MINIMIZE)
         assert not is_minimize_command(WM_SYSCOMMAND, 0xF060)
         assert tray_click(WM_LBUTTONUP) == "open"
@@ -2970,7 +3039,8 @@ def self_check() -> None:
         assert tray_click(WM_CONTEXTMENU) == "menu"
         assert tray_click(0x0200) == ""
         plan_visible = bool(app.plan_window is not None and app.plan_window.winfo_viewable())
-        assert app._handle_window_message(WM_SYSCOMMAND, SC_MINIMIZE, 0)
+        user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+        user32.SendMessageW(app._tray_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
         app.update()
         assert app._in_tray and app._tray_added
         assert not app.winfo_viewable()
@@ -2981,6 +3051,10 @@ def self_check() -> None:
         assert app.winfo_viewable()
         if plan_visible:
             assert app.plan_window.winfo_viewable()
+        app.iconify()
+        app.update()
+        assert app._in_tray and not app.winfo_viewable()
+        app._restore_from_tray()
         app._restore_from_tray()
         app.withdraw()
         children = app.tree.get_children()
