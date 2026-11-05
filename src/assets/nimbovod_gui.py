@@ -141,6 +141,234 @@ def use_dark_titlebar(widget: tk.Misc) -> None:
         return
 
 
+WM_DESTROY = 0x0002
+WM_NULL = 0x0000
+WM_CONTEXTMENU = 0x007B
+WM_SYSCOMMAND = 0x0112
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+WM_TRAY = 0x8001
+SC_MINIMIZE = 0xF020
+NIM_ADD = 0x00000000
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+TRAY_MENU_OPEN = 1
+TRAY_MENU_EXIT = 2
+
+
+def is_minimize_command(message: int, wparam: int) -> bool:
+    return message == WM_SYSCOMMAND and (int(wparam) & 0xFFF0) == SC_MINIMIZE
+
+
+def tray_click(mouse: int) -> str:
+    if mouse in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+        return "open"
+    if mouse in (WM_RBUTTONUP, WM_CONTEXTMENU):
+        return "menu"
+    return ""
+
+
+_TRAY_APIS = None
+
+
+def _prepare_tray_apis():
+    global _TRAY_APIS
+    if _TRAY_APIS is not None:
+        return _TRAY_APIS
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    gdi32 = ctypes.windll.gdi32
+    lresult = ctypes.c_ssize_t
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.CallWindowProcW.restype = lresult
+    user32.CreatePopupMenu.argtypes = []
+    user32.CreatePopupMenu.restype = wintypes.HMENU
+    user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+    user32.AppendMenuW.restype = wintypes.BOOL
+    user32.TrackPopupMenu.argtypes = [
+        wintypes.HMENU,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        ctypes.c_void_p,
+    ]
+    user32.TrackPopupMenu.restype = ctypes.c_uint
+    user32.DestroyMenu.argtypes = [wintypes.HMENU]
+    user32.DestroyMenu.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+    user32.LoadIconW.restype = wintypes.HICON
+    user32.CreateIconIndirect.argtypes = [ctypes.c_void_p]
+    user32.CreateIconIndirect.restype = wintypes.HICON
+    user32.DestroyIcon.argtypes = [wintypes.HICON]
+    user32.DestroyIcon.restype = wintypes.BOOL
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.CreateDIBSection.argtypes = [
+        wintypes.HDC,
+        ctypes.c_void_p,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_void_p),
+        wintypes.HANDLE,
+        wintypes.DWORD,
+    ]
+    gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+    gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+    gdi32.CreateBitmap.restype = wintypes.HBITMAP
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    _TRAY_APIS = (user32, shell32, gdi32, lresult)
+    return _TRAY_APIS
+
+
+def create_tray_icon(size: int = 32):
+    """Draw a blue notification icon. Returns (handle, owned). A shared fallback icon is not owned."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32, _shell32, gdi32, _lresult = _prepare_tray_apis()
+
+    class BitmapInfoHeader(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class BitmapInfo(ctypes.Structure):
+        _fields_ = [("bmiHeader", BitmapInfoHeader), ("bmiColors", wintypes.DWORD * 1)]
+
+    class IconInfo(ctypes.Structure):
+        _fields_ = [
+            ("fIcon", wintypes.BOOL),
+            ("xHotspot", wintypes.DWORD),
+            ("yHotspot", wintypes.DWORD),
+            ("hbmMask", wintypes.HBITMAP),
+            ("hbmColor", wintypes.HBITMAP),
+        ]
+
+    def fallback():
+        handle = user32.LoadIconW(None, 32512)
+        return (handle or 0), False
+
+    pixels = bytearray(size * size * 4)
+    radius = 7
+    for y in range(size):
+        for x in range(size):
+            outside = False
+            corners = (
+                (radius, radius),
+                (size - 1 - radius, radius),
+                (radius, size - 1 - radius),
+                (size - 1 - radius, size - 1 - radius),
+            )
+            if x < radius or x > size - 1 - radius:
+                if y < radius or y > size - 1 - radius:
+                    corner_x, corner_y = min(corners, key=lambda point: (point[0] - x) ** 2 + (point[1] - y) ** 2)
+                    outside = (x - corner_x) ** 2 + (y - corner_y) ** 2 > radius * radius
+            if x < 1 or y < 1 or x > size - 2 or y > size - 2:
+                outside = True
+            left = size * 0.34
+            right = size * 0.72
+            top = size * 0.28
+            bottom = size * 0.72
+            play = False
+            if left <= x <= right:
+                span = (bottom - top) / 2 * (1 - (x - left) / (right - left))
+                play = abs(y - (top + bottom) / 2) <= span
+            if outside:
+                blue = green = red = alpha = 0
+            elif play:
+                blue, green, red, alpha = 0xFF, 0xF8, 0xF7, 255
+            else:
+                blue, green, red, alpha = 0xFF, 0x8C, 0x6E, 255
+            offset = ((size - 1 - y) * size + x) * 4
+            pixels[offset] = blue * alpha // 255
+            pixels[offset + 1] = green * alpha // 255
+            pixels[offset + 2] = red * alpha // 255
+            pixels[offset + 3] = alpha
+    color = mask = 0
+    try:
+        info = BitmapInfo()
+        info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+        info.bmiHeader.biWidth = size
+        info.bmiHeader.biHeight = size
+        info.bmiHeader.biPlanes = 1
+        info.bmiHeader.biBitCount = 32
+        bits = ctypes.c_void_p()
+        screen = user32.GetDC(None)
+        color = gdi32.CreateDIBSection(screen, ctypes.byref(info), 0, ctypes.byref(bits), None, 0)
+        user32.ReleaseDC(None, screen)
+        if not color or not bits:
+            return fallback()
+        raw = (ctypes.c_ubyte * len(pixels)).from_buffer_copy(pixels)
+        ctypes.memmove(bits, raw, len(pixels))
+        mask_bits = (ctypes.c_ubyte * (size * size // 8))()
+        mask = gdi32.CreateBitmap(size, size, 1, 1, ctypes.cast(mask_bits, ctypes.c_void_p))
+        icon = IconInfo()
+        icon.fIcon = True
+        icon.hbmMask = mask
+        icon.hbmColor = color
+        handle = user32.CreateIconIndirect(ctypes.byref(icon))
+        if not handle:
+            return fallback()
+        return handle, True
+    except Exception:
+        return fallback()
+    finally:
+        if color:
+            gdi32.DeleteObject(color)
+        if mask:
+            gdi32.DeleteObject(mask)
+
+
+def _tray_icon_type():
+    import ctypes
+    from ctypes import wintypes
+
+    class NotifyIconData(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uID", wintypes.UINT),
+            ("uFlags", wintypes.UINT),
+            ("uCallbackMessage", wintypes.UINT),
+            ("hIcon", wintypes.HICON),
+            ("szTip", wintypes.WCHAR * 128),
+        ]
+
+    return NotifyIconData
+
+
 def app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -455,6 +683,14 @@ class App(tk.Tk):
         self._ready = False
         self._auto_queue: list[str] = []
         self._auto_note = ""
+        self._in_tray = False
+        self._tray_added = False
+        self._tray_hwnd = 0
+        self._tray_proc = None
+        self._old_wndproc = None
+        self._tray_icon = None
+        self._tray_icon_owned = False
+        self._plan_hidden_for_tray = False
         self.title("NimboVoD")
         self.geometry("560x800")
         self.minsize(480, 640)
@@ -693,6 +929,7 @@ class App(tk.Tk):
         self._build_form()
         self.bind("<Configure>", self._on_resize)
         self.after_idle(lambda: use_dark_titlebar(self))
+        self.after_idle(self._install_tray_hook)
 
     def _on_resize(self, event: tk.Event) -> None:
         if event.widget is self:
@@ -2366,6 +2603,229 @@ class App(tk.Tk):
         self._save_settings()
         self.destroy()
 
+    def destroy(self) -> None:
+        self._tray_remove()
+        self._unhook_window()
+        super().destroy()
+
+    def _install_tray_hook(self) -> None:
+        if sys.platform != "win32" or self._tray_proc is not None:
+            return
+        try:
+            import ctypes
+
+            user32, _shell32, _gdi32, lresult = _prepare_tray_apis()
+            self.update_idletasks()
+            hwnd = user32.GetAncestor(int(self.winfo_id()), 2) or int(self.winfo_id())
+            if not hwnd:
+                return
+            wndproc = ctypes.WINFUNCTYPE(lresult, ctypes.wintypes.HWND, ctypes.wintypes.UINT, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+            # Windows keeps this pointer. It has to stay referenced for the life of the window.
+            self._tray_proc = wndproc(self._wndproc)
+            previous = user32.SetWindowLongPtrW(hwnd, -4, ctypes.cast(self._tray_proc, ctypes.c_void_p))
+            if not previous:
+                self._tray_proc = None
+                return
+            self._tray_hwnd = hwnd
+            self._old_wndproc = previous
+        except Exception:
+            self._tray_proc = None
+            self._old_wndproc = None
+
+    def _unhook_window(self) -> None:
+        if self._tray_proc is None or not self._tray_hwnd or not self._old_wndproc:
+            self._tray_proc = None
+            self._old_wndproc = None
+            return
+        try:
+            import ctypes
+
+            user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+            user32.SetWindowLongPtrW(self._tray_hwnd, -4, ctypes.c_void_p(self._old_wndproc))
+        except Exception:
+            pass
+        self._tray_proc = None
+        self._old_wndproc = None
+
+    def _wndproc(self, hwnd, message, wparam, lparam):
+        import ctypes
+
+        handled = False
+        try:
+            handled = self._handle_window_message(int(message), int(wparam), int(lparam))
+        except Exception:
+            handled = False
+        if handled:
+            return 0
+        if not self._old_wndproc:
+            return 0
+        try:
+            user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+            return user32.CallWindowProcW(ctypes.c_void_p(self._old_wndproc), hwnd, message, wparam, lparam)
+        except Exception:
+            return 0
+
+    def _handle_window_message(self, message: int, wparam: int, lparam: int) -> bool:
+        if is_minimize_command(message, wparam):
+            self.after(0, self._minimize_to_tray)
+            return True
+        if message == WM_TRAY:
+            action = tray_click(int(lparam) & 0xFFFF)
+            if self._in_tray and action == "open":
+                self.after(0, self._restore_from_tray)
+            elif self._in_tray and action == "menu":
+                self.after(0, self._show_tray_menu)
+            return True
+        return False
+
+    def _minimize_to_tray(self) -> bool:
+        if self._in_tray:
+            return True
+        if not self._tray_add():
+            try:
+                self.iconify()
+            except tk.TclError:
+                pass
+            return False
+        self._plan_hidden_for_tray = self._withdraw_plan_if_visible()
+        try:
+            self.withdraw()
+        except tk.TclError:
+            self._tray_remove()
+            self._plan_hidden_for_tray = False
+            return False
+        self._in_tray = True
+        return True
+
+    def _withdraw_plan_if_visible(self) -> bool:
+        plan = self.plan_window
+        if plan is None:
+            return False
+        try:
+            if not plan.winfo_exists() or not plan.winfo_viewable():
+                return False
+            plan.withdraw()
+        except tk.TclError:
+            return False
+        return True
+
+    def _restore_from_tray(self) -> None:
+        was_hidden = self._in_tray
+        show_plan = self._plan_hidden_for_tray
+        self._plan_hidden_for_tray = False
+        self._in_tray = False
+        self._tray_remove()
+        if not was_hidden:
+            return
+        try:
+            self.deiconify()
+            self.state("normal")
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            return
+        if self._tray_hwnd:
+            try:
+                user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+                user32.SetForegroundWindow(self._tray_hwnd)
+            except Exception:
+                pass
+        if not show_plan or self.plan_window is None:
+            return
+        try:
+            if self.plan_window.winfo_exists():
+                self.plan_window.deiconify()
+                self.plan_window.lift()
+        except tk.TclError:
+            return
+
+    def _show_tray_menu(self) -> None:
+        if not self._in_tray or not self._tray_hwnd:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
+            menu = user32.CreatePopupMenu()
+            if not menu:
+                return
+            user32.AppendMenuW(menu, 0, TRAY_MENU_OPEN, "Open NimboVoD")
+            user32.AppendMenuW(menu, 0, TRAY_MENU_EXIT, "Exit")
+            user32.SetForegroundWindow(self._tray_hwnd)
+            point = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(point))
+            command = user32.TrackPopupMenu(menu, 0x0002 | 0x0100 | 0x0080 | 0x0020, int(point.x), int(point.y), 0, self._tray_hwnd, None)
+            user32.PostMessageW(self._tray_hwnd, WM_NULL, 0, 0)
+            user32.DestroyMenu(menu)
+        except Exception:
+            return
+        if command == TRAY_MENU_OPEN:
+            self._restore_from_tray()
+        elif command == TRAY_MENU_EXIT:
+            self._on_close()
+
+    def _tray_add(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        if not self._tray_hwnd:
+            self._install_tray_hook()
+        if not self._tray_hwnd:
+            return False
+        if self._tray_added:
+            return True
+        try:
+            import ctypes
+
+            _user32, shell32, _gdi32, _lresult = _prepare_tray_apis()
+            if not self._tray_icon:
+                handle, owned = create_tray_icon()
+                if not handle:
+                    return False
+                self._tray_icon = handle
+                self._tray_icon_owned = owned
+            data = _tray_icon_type()()
+            data.cbSize = ctypes.sizeof(data)
+            data.hWnd = self._tray_hwnd
+            data.uID = 1
+            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            data.uCallbackMessage = WM_TRAY
+            data.hIcon = self._tray_icon
+            data.szTip = "NimboVoD"
+            pointer = ctypes.byref(data)
+            if shell32.Shell_NotifyIconW(NIM_ADD, pointer):
+                self._tray_added = True
+                return True
+            shell32.Shell_NotifyIconW(NIM_DELETE, pointer)
+            if shell32.Shell_NotifyIconW(NIM_ADD, pointer):
+                self._tray_added = True
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _tray_remove(self) -> None:
+        if sys.platform != "win32":
+            self._tray_added = False
+            return
+        try:
+            import ctypes
+
+            user32, shell32, _gdi32, _lresult = _prepare_tray_apis()
+            if self._tray_added and self._tray_hwnd:
+                data = _tray_icon_type()()
+                data.cbSize = ctypes.sizeof(data)
+                data.hWnd = self._tray_hwnd
+                data.uID = 1
+                shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(data))
+            if self._tray_icon and self._tray_icon_owned:
+                user32.DestroyIcon(self._tray_icon)
+        except Exception:
+            pass
+        self._tray_added = False
+        self._tray_icon = None
+        self._tray_icon_owned = False
+
 
 def self_check() -> None:
     cleaner = load_cleaner()
@@ -2500,6 +2960,29 @@ def self_check() -> None:
         app.load_sample()
         app.show_plan()
         app.update()
+        app._install_tray_hook()
+        assert app._tray_proc is not None and app._tray_hwnd
+        assert is_minimize_command(WM_SYSCOMMAND, SC_MINIMIZE)
+        assert not is_minimize_command(WM_SYSCOMMAND, 0xF060)
+        assert tray_click(WM_LBUTTONUP) == "open"
+        assert tray_click(WM_LBUTTONDBLCLK) == "open"
+        assert tray_click(WM_RBUTTONUP) == "menu"
+        assert tray_click(WM_CONTEXTMENU) == "menu"
+        assert tray_click(0x0200) == ""
+        plan_visible = bool(app.plan_window is not None and app.plan_window.winfo_viewable())
+        assert app._handle_window_message(WM_SYSCOMMAND, SC_MINIMIZE, 0)
+        app.update()
+        assert app._in_tray and app._tray_added
+        assert not app.winfo_viewable()
+        if plan_visible:
+            assert not app.plan_window.winfo_viewable()
+        app._restore_from_tray()
+        assert not app._in_tray and not app._tray_added
+        assert app.winfo_viewable()
+        if plan_visible:
+            assert app.plan_window.winfo_viewable()
+        app._restore_from_tray()
+        app.withdraw()
         children = app.tree.get_children()
         assert children, "sample plan did not fill the list"
         app.sources = [{"kind": "file", "label": "tagged", "entries": tagged}]

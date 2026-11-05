@@ -8,6 +8,8 @@ The program is not stored in git. Settings, including the API key, are saved in 
 
 ## Use the window
 
+Minimizing the window hides NimboVoD in the notification area. Click the icon to open it again, or right-click it and choose **Exit**.
+
 **Settings**
 
 - **Run NimboVoD when Windows starts** opens the program when you sign in. It uses your account and does not need administrator rights.
