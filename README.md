@@ -1,24 +1,49 @@
 # NimboVoD
 
-Turn one or more M3U playlists into a folder of `.strm` files, then leave out anything already in an Emby library.
+NimboVoD is a Windows program that turns M3U playlists into a folder of `.strm` files and leaves out anything already in an Emby library.
 
-Download `nimbovod.exe` from the [v1 release](https://github.com/Coldsac/NimboVoD/releases/tag/v1). A home-network Emby address such as `http://192.168.x.x:8096` works because the program runs on your computer.
+Download [nimbovod.exe](https://github.com/Coldsac/NimboVoD/releases/tag/v1). It runs on your computer, so a home-network address such as `http://192.168.1.20:8096` works. The program is 64-bit and needs Windows 10 or newer. Windows may say it protected your PC because the file is not signed. Choose **More info**, then **Run anyway**.
 
-## Windows program
+The program is not stored in git. Settings, including the API key, are saved in plain text at `%LOCALAPPDATA%\NimboVoD\settings.json`.
 
-1. Add playlist links or choose `.m3u` files, then click **Load playlists**.
-2. Enter the Emby address and API key, then click **Pull library**.
-3. Choose the save folder.
-4. Click **View plan** to see what will be kept and left out.
-5. Click **Write .strm files** when the plan looks right. Nothing is written or deleted before that, unless automatic updates are turned on in Settings.
+## Use the window
 
-Settings can open NimboVoD when you sign in to Windows, and can reload playlists, read Emby, and update the `.strm` folder when the program opens.
+**Settings**
 
-Windows may say it protected your PC because the file is not signed. Choose **More info**, then **Run anyway**. The program is 64-bit and needs Windows 10 or newer.
+- **Run NimboVoD when Windows starts** opens the program when you sign in. It uses your account and does not need administrator rights.
+- **Automatically pull the M3U playlists** reloads the saved links and local playlist files.
+- **Automatically pull the Emby library** reads Emby with the saved address and API key.
+- **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out.
 
-The built program is not stored in git. Settings, including the API key, are saved in `%LOCALAPPDATA%\NimboVoD\settings.json`.
+These automatic steps are off until you turn them on. They run when the program opens. Updating the folder does not ask again.
 
-## Build the Windows program
+**Playlists**
+
+Add M3U links or choose local `.m3u` files, then click **Load playlists**. The same stream URL is kept once.
+
+**Folder layout**
+
+- **By group** puts each group-title in its own folder.
+- **Flat** puts every file in one folder.
+- **Movies & TV** uses `Movies/` for movies and `TV/Show/Season 01/` for episodes.
+
+**Strip quality tags from file names** is on by default. It removes tags such as `1080p`, `x265`, `[WEB]`, `[x264]`, `[TS]`, `Megusta`, and empty brackets. The full list is shown in the window. **Also strip these tags** removes extra words you type, both from file names and when matching Emby.
+
+**Remove duplicate .strm files** is on by default. The first stream that cleans up to a file is kept. Later copies are left out, and numbered files already in the folder, such as `Name (2).strm`, are removed.
+
+**Emby library**
+
+Enter the server address and API key, then click **Pull library**. User id is optional. You can also upload a library export or paste titles, one per line. Episodes such as `Show S01E02` are matched as episodes.
+
+**Where the .strm files go**
+
+Choose the save folder.
+
+- **View plan** opens the list of files that will be kept and left out.
+- **Write .strm files** asks before it changes the folder. It writes new files and removes ones the plan leaves out. Other files in that folder stay.
+- **Save report** writes that plan to a text file.
+
+## Build
 
 On 64-bit Windows, from this repository, with Python 3.12:
 
@@ -30,8 +55,10 @@ copy dist\nimbovod.exe nimbovod.exe
 
 ## Command line
 
-The same cleaner is in `src/assets/nimbovod-cleaner.py`. It only needs Python 3.
+`src/assets/nimbovod-cleaner.py` is the same cleaner the window uses. Without `--apply` it only prints the plan.
 
 ```
 py -3.12 src/assets/nimbovod-cleaner.py --m3u https://example.com/a.m3u --out "D:\Media\strm" --emby http://192.168.1.20:8096 --api-key KEY --apply
 ```
+
+`--layout` is `group`, `flat`, or `library`. `--keep-quality` leaves quality tags in file names. `--strip-tag YTS` removes an extra tag. `--keep-duplicate-strm` keeps a second file instead of leaving the duplicate out.
