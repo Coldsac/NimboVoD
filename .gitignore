@@ -10,5 +10,6 @@ cleaner-win/target
 cleaner-win/.cargo/config.toml
 cleaner-win/python-embed.zip
 public/nimbovod-cleaner.exe
+nimbovod.exe
 .env
 .env.*

@@ -1,0 +1,1987 @@
+#!/usr/bin/env python3
+"""NimboVoD desktop window.
+
+Load M3U playlists, compare them with an Emby library, and write the .strm
+folder. Nothing is written or deleted until Write .strm files is confirmed,
+unless automatic updates are turned on in Settings.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import threading
+import tkinter as tk
+# The cleaner is loaded from a separate file, so PyInstaller only sees imports made here.
+import urllib.error
+import urllib.request
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlparse
+
+CANVAS = "#090b10"
+SURFACE = "#12151c"
+RAISED = "#1b2130"
+FIELD = "#0c0f14"
+FG = "#eef1f6"
+MUTED = "#8e97a8"
+LINE = "#2a3142"
+ACCENT = "#6e8cff"
+ACCENT_ACTIVE = "#8aa4ff"
+SELECT = "#243454"
+ERROR_BG = "#1a1418"
+ERROR_FG = "#f0c8d0"
+ERROR_LINE = "#c45d6e"
+MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
+TREE_LIMIT = 2500
+
+LAYOUT_HINTS = {
+    "group": "One folder per group-title. The same stream URL in two playlists is kept once.",
+    "flat": "Every .strm file goes in a single folder.",
+    "library": "Movies go in Movies/. Episodes go under TV/Show/Season 01/.",
+}
+
+SAMPLE_PLAYLIST = """#EXTM3U
+#EXTINF:-1 tvg-id="matrix" group-title="Movies",The Matrix (1999)
+https://example.com/streams/the-matrix-1999
+#EXTINF:-1 group-title="Movies",Inception (2010) 1080p
+https://example.com/streams/inception-2010
+#EXTINF:-1 group-title="Movies",Inception.2010.UHD.BluRay
+https://example.com/streams/inception-uhd
+#EXTINF:-1 group-title="Movies",Dune (2021)
+https://example.com/streams/dune-2021
+#EXTINF:-1 group-title="Classic Movies",Dune (1984)
+https://example.com/streams/dune-1984
+#EXTINF:-1 group-title="Movies",Arrival (2016)
+https://example.com/streams/arrival
+#EXTINF:-1 group-title="Movies",Blade Runner 2049
+https://example.com/streams/blade-runner-2049
+#EXTINF:-1 group-title="Movies",Heat (1995)
+https://example.com/streams/heat
+#EXTINF:-1 group-title="Movies",The Matrix (1999)
+https://example.com/streams/the-matrix-1999
+#EXTINF:-1 group-title="TV",The Office (2005)
+https://example.com/streams/the-office
+#EXTINF:-1 group-title="TV",The Office S01E01
+https://example.com/streams/the-office-s01e01
+#EXTINF:-1 group-title="TV",The Office S01E03
+https://example.com/streams/the-office-s01e03
+#EXTINF:-1 group-title="TV",Severance S01E01
+https://example.com/streams/severance-s01e01
+#EXTINF:-1 group-title="TV",Severance S01E02
+https://example.com/streams/severance-s01e02
+#EXTINF:-1 group-title="Live TV",City News
+https://example.com/streams/city-news
+"""
+
+SAMPLE_LIBRARY = [
+    {"name": "The Matrix", "year": 1999, "type": "Movie", "path": "/media/movies/The Matrix (1999).mkv"},
+    {"name": "Inception", "year": 2010, "type": "Movie", "path": "/media/movies/Inception (2010).mkv"},
+    {"name": "Dune", "year": 2021, "type": "Movie", "path": "/media/movies/Dune (2021).mkv"},
+    {"name": "Arrival", "year": 2016, "type": "Movie"},
+    {"name": "Heat", "year": 1995, "type": "Movie"},
+    {"name": "The Office", "year": 2005, "type": "Series"},
+    {"name": "Pilot", "year": 2005, "type": "Episode", "seriesName": "The Office", "season": 1, "episode": 1},
+    {"name": "Diversity Day", "year": 2005, "type": "Episode", "seriesName": "The Office", "season": 1, "episode": 2},
+    {"name": "Severance", "year": 2022, "type": "Series"},
+    {
+        "name": "Good News About Hell",
+        "year": 2022,
+        "type": "Episode",
+        "seriesName": "Severance",
+        "season": 1,
+        "episode": 1,
+    },
+]
+
+
+def ensure_stdio() -> None:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+def enable_dpi() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        return
+
+
+def use_dark_titlebar(widget: tk.Misc) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetAncestor(int(widget.winfo_id()), 2)
+        if not hwnd:
+            return
+        value = ctypes.c_int(1)
+        dwm = ctypes.windll.dwmapi
+        applied = False
+        for attribute in (20, 19):
+            if dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                applied = True
+                break
+        if applied:
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+    except Exception:
+        return
+
+
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def cleaner_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS")) / "nimbovod-cleaner.py"
+    return Path(__file__).resolve().with_name("nimbovod-cleaner.py")
+
+
+def settings_path() -> Path:
+    override = os.environ.get("NIMBOVOD_SETTINGS", "").strip()
+    if override:
+        return Path(override)
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    root = Path(local) if local else Path.home() / "AppData" / "Local"
+    folder = root / "NimboVoD"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "settings.json"
+
+
+STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_RUN_NAME = "NimboVoD"
+
+
+def startup_registration_allowed() -> bool:
+    """Change the real sign-in startup entry only for the packaged exe."""
+    if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
+        return False
+    return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+
+def startup_command() -> str:
+    return f'"{Path(sys.executable).resolve()}"'
+
+
+def read_startup_command() -> str | None:
+    if sys.platform != "win32":
+        return None
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_QUERY_VALUE) as key:
+            value, _kind = winreg.QueryValueEx(key, STARTUP_RUN_NAME)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def apply_startup_registration(enabled: bool) -> str | None:
+    if not startup_registration_allowed():
+        return None
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_RUN_NAME, 0, winreg.REG_SZ, startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_RUN_NAME)
+                except FileNotFoundError:
+                    pass
+    except OSError as exc:
+        return f"Could not update Windows startup: {exc}"
+    return None
+
+
+def auto_steps(pull_playlists: bool, pull_emby: bool, apply_strm: bool) -> list[str]:
+    steps: list[str] = []
+    if pull_playlists:
+        steps.append("playlists")
+    if pull_emby:
+        steps.append("emby")
+    if apply_strm:
+        steps.append("apply")
+    return steps
+
+
+def load_cleaner():
+    path = cleaner_path()
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing cleaner logic: {path}")
+    spec = importlib.util.spec_from_file_location("nimbovod_cleaner", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load cleaner logic from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def explain(exc: BaseException) -> str:
+    if isinstance(exc, SystemExit):
+        if isinstance(exc.code, str) and exc.code.strip():
+            return exc.code.strip()
+        if exc.code in (None, 0, ""):
+            return "Stopped."
+        return str(exc.code)
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def playlist_label(source: str) -> str:
+    if source.startswith("http://") or source.startswith("https://"):
+        parsed = urlparse(source)
+        last = [part for part in parsed.path.split("/") if part]
+        return last[-1] if last else (parsed.hostname or source)
+    return Path(source).name or source
+
+
+def looks_like_playlist(text: str) -> bool:
+    head = text[:4000]
+    return "#EXTM3U" in head.upper() or "#EXTINF:" in head.upper()
+
+
+def optional_number(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def as_kind(value: object) -> str:
+    if value in {"Movie", "Series", "Episode"}:
+        return str(value)
+    return "Other"
+
+
+def map_record(raw: object, cleaner) -> dict | None:
+    if isinstance(raw, str):
+        name = raw.strip()
+        if not name:
+            return None
+        _key, year = cleaner.normalize_title(name)
+        return {"name": name, "year": year, "type": "Movie"}
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("Name") if isinstance(raw.get("Name"), str) else raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    year = optional_number(raw.get("ProductionYear", raw.get("year")))
+    if year is None:
+        _key, year = cleaner.normalize_title(name)
+    path = raw.get("Path", raw.get("path"))
+    series = raw.get("SeriesName", raw.get("seriesName"))
+    item = {
+        "name": name.strip(),
+        "year": year,
+        "type": as_kind(raw.get("Type", raw.get("type"))),
+    }
+    if isinstance(path, str) and path.strip():
+        item["path"] = path
+    if isinstance(series, str) and series.strip():
+        item["seriesName"] = series.strip()
+    season = optional_number(raw.get("ParentIndexNumber", raw.get("season")))
+    episode = optional_number(raw.get("IndexNumber", raw.get("episode")))
+    if season is not None:
+        item["season"] = season
+    if episode is not None:
+        item["episode"] = episode
+    return item
+
+
+def extract_records(parsed: object) -> list:
+    if isinstance(parsed, list):
+        return parsed
+    if not isinstance(parsed, dict):
+        return []
+    nested = parsed.get("Items", parsed.get("items", parsed.get("results")))
+    if isinstance(nested, list):
+        return nested
+    if isinstance(parsed.get("name"), str) or isinstance(parsed.get("Name"), str):
+        return [parsed]
+    return []
+
+
+def parse_library_text(text: str, cleaner) -> list[dict]:
+    trimmed = text.replace("\ufeff", "").strip()
+    if not trimmed:
+        return []
+    if trimmed.startswith("{") or trimmed.startswith("["):
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError as exc:
+            raise ValueError("That file is not valid JSON.") from exc
+        items = [item for item in (map_record(record, cleaner) for record in extract_records(parsed)) if item]
+        if not items:
+            raise ValueError("No library titles were found in that JSON.")
+        return items
+    items: list[dict] = []
+    for line in trimmed.splitlines():
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        episode = cleaner.parse_episode(name)
+        if episode:
+            show, season, number, _rest = episode
+            _key, year = cleaner.normalize_title(show)
+            items.append(
+                {
+                    "name": name,
+                    "year": year,
+                    "type": "Episode",
+                    "seriesName": show,
+                    "season": season,
+                    "episode": number,
+                }
+            )
+            continue
+        _key, year = cleaner.normalize_title(name)
+        items.append({"name": name, "year": year, "type": "Movie"})
+    if not items:
+        raise ValueError("No titles were found. Put one title on each line.")
+    return items
+
+
+def report_text(planned: list[dict], source_label: str, compared: bool) -> str:
+    kept = [row for row in planned if row["disposition"] == "keep"]
+    dropped = [row for row in planned if row["disposition"] != "keep"]
+    lines = [
+        "NimboVoD report",
+        f"Source: {source_label or 'playlist'}",
+        f"Compared with Emby: {'yes' if compared else 'no'}",
+        f"New .strm files: {len(kept)}",
+        f"Left out: {len(dropped)}",
+        "",
+        "Left out",
+    ]
+    lines.extend(
+        f"{row['path']}\t{row.get('reason', '')}\t{row['title']}" for row in dropped
+    )
+    if not dropped:
+        lines.append("(none)")
+    lines.extend(["", "Kept"])
+    lines.extend(f"{row['path']}\t{row['title']}" for row in kept)
+    if not kept:
+        lines.append("(none)")
+    lines.append("")
+    return "\n".join(lines)
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleaner = load_cleaner()
+        self._tag_job: str | None = None
+        self._wheel_job: str | None = None
+        self._wheel_pending = 0.0
+        self.links: list[str] = []
+        self.playlist_files: list[str] = []
+        self.sources: list[dict] = []
+        self.library: list[dict] | None = None
+        self.library_label = ""
+        self.planned: list[dict] = []
+        self._buttons: list[ttk.Button] = []
+        self._busy = False
+        self._ready = False
+        self._auto_queue: list[str] = []
+        self._auto_note = ""
+        self.title("NimboVoD")
+        self.geometry("560x800")
+        self.minsize(480, 640)
+        self.plan_window: tk.Toplevel | None = None
+        self.configure(bg=CANVAS)
+        self._init_vars()
+        self._apply_style()
+        self._build()
+        self._load_settings()
+        self._bind_options()
+        self._ready = True
+        self._update_layout_hint()
+        self._sync_startup_registration()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(400, self._startup_auto)
+
+    def _init_vars(self) -> None:
+        self.link_entry = tk.StringVar()
+        self.out_dir = tk.StringVar()
+        self.emby = tk.StringVar()
+        self.api_key = tk.StringVar()
+        self.user_id = tk.StringVar()
+        self.layout = tk.StringVar(value="group")
+        self.strip_quality = tk.IntVar(value=1)
+        self.drop_duplicate_strm = tk.IntVar(value=1)
+        self.use_years = tk.IntVar(value=1)
+        self.match_filenames = tk.IntVar(value=1)
+        self.run_at_startup = tk.IntVar(value=0)
+        self.auto_pull_playlists = tk.IntVar(value=0)
+        self.auto_pull_emby = tk.IntVar(value=0)
+        self.auto_apply_strm = tk.IntVar(value=0)
+        self.show_key = tk.IntVar(value=0)
+        self.filter_mode = tk.StringVar(value="All")
+        self.query = tk.StringVar()
+        self.summary = tk.StringVar(value="")
+        self.status = tk.StringVar(value="Ready")
+        self.library_status = tk.StringVar(value="No library loaded. Every stream will be kept.")
+        self.layout_hint = tk.StringVar(value=LAYOUT_HINTS["group"])
+
+    def _apply_style(self) -> None:
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(".", background=CANVAS, foreground=FG, font=("Segoe UI", 10))
+        style.configure("TFrame", background=CANVAS)
+        style.configure("Card.TFrame", background=SURFACE)
+        style.configure("TLabel", background=CANVAS, foreground=FG)
+        style.configure("Muted.TLabel", background=CANVAS, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Card.TLabel", background=SURFACE, foreground=FG)
+        style.configure("CardMuted.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("CardTitle.TLabel", background=SURFACE, foreground=FG, font=("Segoe UI", 12))
+        style.configure(
+            "TEntry",
+            fieldbackground=FIELD,
+            foreground=FG,
+            bordercolor=LINE,
+            lightcolor=FIELD,
+            darkcolor=FIELD,
+            insertcolor=FG,
+            padding=6,
+        )
+        style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", FIELD)], darkcolor=[("focus", FIELD)])
+        style.configure(
+            "TButton",
+            background=RAISED,
+            foreground=FG,
+            bordercolor=LINE,
+            lightcolor=RAISED,
+            darkcolor=RAISED,
+            focuscolor=RAISED,
+            padding=(12, 7),
+            relief="flat",
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#242b3a"), ("pressed", "#2c3548"), ("disabled", SURFACE)],
+            bordercolor=[("active", "#3c465c"), ("focus", ACCENT), ("disabled", LINE)],
+            foreground=[("disabled", MUTED)],
+        )
+        style.configure(
+            "Accent.TButton",
+            background=ACCENT,
+            foreground="#f7f8ff",
+            bordercolor=ACCENT,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+            focuscolor=ACCENT,
+            font=("Segoe UI", 10, "bold"),
+            padding=(14, 7),
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", ACCENT_ACTIVE), ("pressed", "#5876ea"), ("disabled", "#2a3348")],
+            bordercolor=[("active", ACCENT_ACTIVE), ("disabled", "#2a3348")],
+            foreground=[("disabled", MUTED)],
+        )
+        style.configure(
+            "Card.TCheckbutton",
+            background=SURFACE,
+            foreground=FG,
+            indicatorcolor=FIELD,
+            focuscolor=SURFACE,
+        )
+        style.map(
+            "Card.TCheckbutton",
+            background=[("active", SURFACE)],
+            indicatorcolor=[("selected", ACCENT), ("!selected", FIELD)],
+        )
+        style.configure(
+            "Card.TRadiobutton",
+            background=SURFACE,
+            foreground=FG,
+            indicatorcolor=FIELD,
+            focuscolor=SURFACE,
+        )
+        style.map(
+            "Card.TRadiobutton",
+            background=[("active", SURFACE)],
+            indicatorcolor=[("selected", ACCENT), ("!selected", FIELD)],
+        )
+        style.configure(
+            "Treeview",
+            background=FIELD,
+            fieldbackground=FIELD,
+            foreground=FG,
+            bordercolor=FIELD,
+            lightcolor=FIELD,
+            darkcolor=FIELD,
+            rowheight=30,
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=SURFACE,
+            foreground=MUTED,
+            bordercolor=LINE,
+            lightcolor=SURFACE,
+            darkcolor=SURFACE,
+            relief="flat",
+            font=("Segoe UI", 9),
+        )
+        style.map("Treeview", background=[("selected", SELECT)], foreground=[("selected", FG)])
+        style.map("Treeview.Heading", background=[("active", RAISED)])
+        style.configure(
+            "TCombobox",
+            fieldbackground=FIELD,
+            background=RAISED,
+            foreground=FG,
+            arrowcolor=MUTED,
+            bordercolor=LINE,
+            lightcolor=FIELD,
+            darkcolor=FIELD,
+            padding=4,
+            arrowsize=14,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", FIELD), ("disabled", SURFACE)],
+            foreground=[("readonly", FG), ("disabled", MUTED)],
+            bordercolor=[("focus", ACCENT)],
+        )
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(
+                f"{orient}.TScrollbar",
+                background=LINE,
+                troughcolor=CANVAS,
+                bordercolor=CANVAS,
+                arrowcolor=MUTED,
+                lightcolor=CANVAS,
+                darkcolor=CANVAS,
+                arrowsize=12,
+            )
+            style.map(f"{orient}.TScrollbar", background=[("active", "#3c465c"), ("!active", LINE)])
+        self.option_add("*TCombobox*Listbox.background", FIELD)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", SELECT)
+        self.option_add("*TCombobox*Listbox.selectForeground", FG)
+        self.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+        self.option_add("*TCombobox*Listbox.relief", "flat")
+
+    def _build(self) -> None:
+        tk.Frame(self, bg=ACCENT, height=2).pack(fill="x")
+        header = tk.Frame(self, bg=CANVAS)
+        header.pack(fill="x", padx=18, pady=(16, 10))
+        text = tk.Frame(header, bg=CANVAS)
+        text.pack(side="left", fill="both", expand=True)
+        tk.Label(text, text="PLAYLIST TO STRM", bg=CANVAS, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+        tk.Label(text, text="NimboVoD", bg=CANVAS, fg=FG, font=("Segoe UI", 22)).pack(anchor="w", pady=(2, 0))
+        self.header_blurb = tk.Label(
+            text,
+            text="Turn one or more M3U playlists into a folder of .strm files, then leave out anything already in your Emby library.",
+            bg=CANVAS,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            anchor="w",
+            wraplength=340,
+        )
+        self.header_blurb.pack(anchor="w", pady=(6, 0))
+        sample = ttk.Button(header, text="Preview sample", command=self.load_sample)
+        sample.pack(side="right", anchor="n", padx=(16, 0))
+        self._buttons.append(sample)
+
+        self.error_host = tk.Frame(self, bg=CANVAS)
+        tk.Frame(self.error_host, bg=ERROR_LINE, width=3).pack(side="left", fill="y")
+        self.error_label = tk.Label(
+            self.error_host,
+            text="",
+            bg=ERROR_BG,
+            fg=ERROR_FG,
+            anchor="w",
+            justify="left",
+            wraplength=1040,
+            padx=12,
+            pady=8,
+            font=("Segoe UI", 9),
+        )
+        self.error_label.pack(side="left", fill="both", expand=True)
+
+        status = tk.Label(
+            self,
+            textvariable=self.status,
+            bg=CANVAS,
+            fg=MUTED,
+            anchor="w",
+            padx=18,
+            pady=8,
+            font=("Segoe UI", 9),
+        )
+        status.pack(side="bottom", fill="x")
+        tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x")
+
+        self.form_host = ttk.Frame(self)
+        self.form_host.pack(fill="both", expand=True, padx=18, pady=(2, 12))
+        self._build_form()
+        self.bind("<Configure>", self._on_resize)
+        self.after_idle(lambda: use_dark_titlebar(self))
+
+    def _on_resize(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self.error_label.configure(wraplength=max(240, event.width - 90))
+            self.header_blurb.configure(wraplength=max(200, event.width - 230))
+
+    def _card(self, parent: tk.Misc, step: str, title: str) -> ttk.Frame:
+        shell = tk.Frame(parent, bg=LINE, padx=1, pady=1)
+        shell.pack(fill="x", pady=(0, 12))
+        frame = ttk.Frame(shell, style="Card.TFrame", padding=(14, 12))
+        frame.pack(fill="both", expand=True)
+        head = ttk.Frame(frame, style="Card.TFrame")
+        head.pack(fill="x", pady=(0, 10))
+        if step:
+            tk.Label(
+                head,
+                text=step,
+                bg=RAISED,
+                fg=ACCENT,
+                font=("Segoe UI", 8, "bold"),
+                padx=6,
+                pady=1,
+            ).pack(side="left", padx=(0, 8))
+        ttk.Label(head, text=title, style="CardTitle.TLabel").pack(side="left")
+        return frame
+
+    def _button(self, parent: tk.Misc, text: str, command, accent: bool = False) -> ttk.Button:
+        button = ttk.Button(parent, text=text, command=command, style="Accent.TButton" if accent else "TButton")
+        self._buttons.append(button)
+        return button
+
+    def _listbox(self, parent: tk.Misc, height: int) -> tk.Listbox:
+        box = tk.Listbox(
+            parent,
+            height=height,
+            bg=FIELD,
+            fg=FG,
+            selectbackground=SELECT,
+            selectforeground=FG,
+            highlightthickness=1,
+            highlightbackground=LINE,
+            highlightcolor=ACCENT,
+            relief="flat",
+            activestyle="none",
+            font=("Segoe UI", 10),
+            borderwidth=0,
+        )
+        box.bind("<MouseWheel>", self._wheel_widget)
+        return box
+
+    def _build_form(self) -> None:
+        shell = self.form_host
+        canvas = tk.Canvas(shell, bg=CANVAS, highlightthickness=0, borderwidth=0)
+        scroll = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set, yscrollincrement=1)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        fitted = {"width": 0, "region": None}
+
+        def _fit_width(event: tk.Event) -> None:
+            if event.widget is not canvas or event.width <= 1 or event.width == fitted["width"]:
+                return
+            fitted["width"] = event.width
+            canvas.itemconfigure(window, width=event.width)
+
+        def _fit_scroll(event: tk.Event) -> None:
+            if event.widget is not inner:
+                return
+            bbox = canvas.bbox("all")
+            if not bbox or bbox == fitted["region"]:
+                return
+            fitted["region"] = bbox
+            canvas.configure(scrollregion=bbox)
+
+        inner.bind("<Configure>", _fit_scroll)
+        canvas.bind("<Configure>", _fit_width)
+        canvas.bind("<MouseWheel>", self._wheel_form)
+        self.form_canvas = canvas
+        self.form_inner = inner
+
+        settings = self._card(inner, "", "Settings")
+        ttk.Checkbutton(
+            settings,
+            text="Run NimboVoD when Windows starts",
+            variable=self.run_at_startup,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w")
+        ttk.Label(
+            settings,
+            text="Opens this program when you sign in. It uses your account, so administrator rights are not required.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 8))
+        ttk.Checkbutton(
+            settings,
+            text="Automatically pull the M3U playlists",
+            variable=self.auto_pull_playlists,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            settings,
+            text="Automatically pull the Emby library",
+            variable=self.auto_pull_emby,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(
+            settings,
+            text="Automatically update the .strm folder",
+            variable=self.auto_apply_strm,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            settings,
+            text=(
+                "Checked steps run when NimboVoD opens. Playlists are the saved links and local playlist files. "
+                "Emby uses the saved address and API key. The folder then gains new .strm files and loses ones the "
+                "plan leaves out. Other files in the folder are left alone. Updating the folder does not ask again."
+            ),
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(6, 0))
+
+        playlists = self._card(inner, "01", "Playlists")
+        ttk.Label(playlists, text="M3U links", style="Card.TLabel").pack(anchor="w")
+        row = ttk.Frame(playlists, style="Card.TFrame")
+        row.pack(fill="x", pady=(4, 6))
+        entry = ttk.Entry(row, textvariable=self.link_entry)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda _event: self.add_link())
+        self._button(row, "Add", self.add_link).pack(side="left", padx=(8, 0))
+        self.link_list = self._listbox(playlists, 4)
+        self.link_list.pack(fill="x", pady=(0, 6))
+        actions = ttk.Frame(playlists, style="Card.TFrame")
+        actions.pack(fill="x")
+        self._button(actions, "Remove link", self.remove_link).pack(side="left")
+        self._button(actions, "Add playlist files", self.add_files).pack(side="left", padx=(8, 0))
+        self._button(actions, "Load playlists", self.load_links, accent=True).pack(side="right")
+        ttk.Label(playlists, text="Loaded", style="Card.TLabel").pack(anchor="w", pady=(10, 4))
+        self.source_list = self._listbox(playlists, 4)
+        self.source_list.pack(fill="x")
+        self._button(playlists, "Remove loaded playlist", self.remove_source).pack(anchor="w", pady=(6, 8))
+
+        ttk.Label(playlists, text="Folder layout", style="Card.TLabel").pack(anchor="w")
+        radios = ttk.Frame(playlists, style="Card.TFrame")
+        radios.pack(fill="x", pady=(4, 4))
+        for value, label in (("group", "By group"), ("flat", "Flat"), ("library", "Movies & TV")):
+            ttk.Radiobutton(
+                radios,
+                text=label,
+                value=value,
+                variable=self.layout,
+                style="Card.TRadiobutton",
+            ).pack(side="left", padx=(0, 10))
+        ttk.Label(playlists, textvariable=self.layout_hint, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
+        ttk.Checkbutton(
+            playlists,
+            text="Strip quality tags from file names",
+            variable=self.strip_quality,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(playlists, text="Quality tags already removed", style="Card.TLabel").pack(anchor="w")
+        ttk.Label(
+            playlists,
+            text=", ".join(self.cleaner.QUALITY_TAGS),
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 8))
+        ttk.Label(playlists, text="Also strip these tags", style="Card.TLabel").pack(anchor="w")
+        ttk.Label(
+            playlists,
+            text="One per line or separated by commas. They are removed from file names along with the quality tags, and ignored when matching Emby.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 4))
+        self.extra_tags = self._text(playlists, 4)
+        self.extra_tags.pack(fill="x")
+        ttk.Checkbutton(
+            playlists,
+            text="Remove duplicate .strm files",
+            variable=self.drop_duplicate_strm,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(8, 0))
+        ttk.Label(
+            playlists,
+            text="When two streams clean up to the same file, the first is kept and the rest are left out. Numbered copies already in the folder, such as Name (2).strm, are removed too.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 0))
+
+        emby = self._card(inner, "02", "Emby library")
+        self._labeled_entry(emby, "Server address", self.emby, "http://192.168.1.20:8096")
+        ttk.Label(
+            emby,
+            text="A 192.168 address works here. This program runs on your computer.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(0, 6))
+        key_row = ttk.Frame(emby, style="Card.TFrame")
+        key_row.pack(fill="x")
+        ttk.Label(key_row, text="API key", style="Card.TLabel").pack(side="left")
+        ttk.Checkbutton(
+            key_row,
+            text="Show",
+            variable=self.show_key,
+            command=self._toggle_key,
+            style="Card.TCheckbutton",
+        ).pack(side="right")
+        self.api_entry = ttk.Entry(emby, textvariable=self.api_key, show="•")
+        self.api_entry.pack(fill="x", pady=(4, 6))
+        self._labeled_entry(emby, "User id", self.user_id, "Optional. Leave blank to read the whole server.")
+        emby_actions = ttk.Frame(emby, style="Card.TFrame")
+        emby_actions.pack(fill="x", pady=(2, 6))
+        self._button(emby_actions, "Pull library", self.pull_emby, accent=True).pack(side="left")
+        self._button(emby_actions, "Upload export", self.upload_library).pack(side="left", padx=(8, 0))
+        self._button(emby_actions, "Clear library", self.clear_library).pack(side="left", padx=(8, 0))
+        ttk.Label(emby, textvariable=self.library_status, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
+        ttk.Label(emby, text="Or paste titles", style="Card.TLabel").pack(anchor="w")
+        ttk.Label(
+            emby,
+            text="One per line. Episodes like Show S01E02 are matched as episodes.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(0, 4))
+        self.paste = self._text(emby, 4)
+        self.paste.pack(fill="x")
+        self._button(emby, "Match pasted titles", self.match_pasted).pack(anchor="w", pady=(6, 0))
+
+        save = self._card(inner, "03", "Where the .strm files go")
+        folder = ttk.Frame(save, style="Card.TFrame")
+        folder.pack(fill="x")
+        ttk.Entry(folder, textvariable=self.out_dir).pack(side="left", fill="x", expand=True)
+        self._button(folder, "Browse", self.browse_out).pack(side="left", padx=(8, 0))
+        write_row = ttk.Frame(save, style="Card.TFrame")
+        write_row.pack(fill="x", pady=(8, 0))
+        self._button(write_row, "Write .strm files", self.write_files, accent=True).pack(side="left")
+        self._button(write_row, "View plan", self.show_plan).pack(side="left", padx=(8, 0))
+        self._button(write_row, "Save report", self.save_report).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            save,
+            text="Write .strm files asks before it changes the folder. With automatic updates on, opening NimboVoD writes new files and removes ones the plan leaves out without asking again. View plan shows what will be kept and left out.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(8, 0))
+
+        def bind_wheel(widget: tk.Misc) -> None:
+            if widget not in (self.link_list, self.source_list, self.paste, self.extra_tags):
+                widget.bind("<MouseWheel>", self._wheel_form)
+            for child in widget.winfo_children():
+                bind_wheel(child)
+
+        bind_wheel(inner)
+
+    def _text(self, parent: tk.Misc, height: int) -> tk.Text:
+        box = tk.Text(
+            parent,
+            height=height,
+            bg=FIELD,
+            fg=FG,
+            insertbackground=FG,
+            selectbackground=SELECT,
+            selectforeground=FG,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=LINE,
+            highlightcolor=ACCENT,
+            font=("Segoe UI", 10),
+            wrap="word",
+            padx=8,
+            pady=6,
+            borderwidth=0,
+        )
+        box.bind("<MouseWheel>", self._wheel_widget)
+        return box
+
+    def _labeled_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, placeholder: str) -> None:
+        ttk.Label(parent, text=label, style="Card.TLabel").pack(anchor="w")
+        ttk.Entry(parent, textvariable=variable).pack(fill="x", pady=(4, 2))
+        ttk.Label(parent, text=placeholder, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
+
+    def show_plan(self) -> None:
+        if not self.planned:
+            self._set_error("Load a playlist to see the plan.")
+            return
+        self._set_error("")
+        if self.plan_window is not None and self.plan_window.winfo_exists():
+            self.fill_tree()
+            self.plan_window.deiconify()
+            self.plan_window.lift()
+            self.plan_window.focus_force()
+            return
+        window = tk.Toplevel(self)
+        self.plan_window = window
+        window.title("NimboVoD plan")
+        window.configure(bg=CANVAS)
+        window.geometry("900x640")
+        window.minsize(640, 420)
+        window.transient(self)
+        window.after_idle(lambda window=window: use_dark_titlebar(window))
+        tk.Frame(window, bg=ACCENT, height=2).pack(fill="x")
+        body = tk.Frame(window, bg=CANVAS)
+        body.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(body, text="Plan", bg=CANVAS, fg=FG, font=("Segoe UI", 16)).pack(anchor="w")
+        summary = tk.Label(
+            body,
+            textvariable=self.summary,
+            bg=CANVAS,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            anchor="w",
+            wraplength=820,
+        )
+        summary.pack(anchor="w", pady=(4, 0))
+
+        def _fit_summary(event: tk.Event) -> None:
+            if event.widget is window:
+                summary.configure(wraplength=max(280, event.width - 48))
+
+        window.bind("<Configure>", _fit_summary)
+        filters = tk.Frame(body, bg=CANVAS)
+        filters.pack(fill="x", pady=(12, 10))
+        ttk.Combobox(
+            filters,
+            textvariable=self.filter_mode,
+            values=("All", "New files", "Left out"),
+            state="readonly",
+            width=12,
+        ).pack(side="left")
+        ttk.Entry(filters, textvariable=self.query).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        table = tk.Frame(body, bg=LINE, padx=1, pady=1)
+        table.pack(fill="both", expand=True)
+        frame = tk.Frame(table, bg=FIELD)
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            frame,
+            columns=("title", "path", "plan", "reason"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.tree.heading("title", text="Title")
+        self.tree.heading("path", text="File")
+        self.tree.heading("plan", text="Plan")
+        self.tree.heading("reason", text="Reason")
+        self.tree.column("title", width=200, anchor="w")
+        self.tree.column("path", width=280, anchor="w")
+        self.tree.column("plan", width=90, anchor="w")
+        self.tree.column("reason", width=260, anchor="w")
+        self.tree.tag_configure("keep", foreground=FG)
+        self.tree.tag_configure("drop", foreground=MUTED)
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.fill_tree()
+        window.protocol("WM_DELETE_WINDOW", self._close_plan)
+
+    def _close_plan(self) -> None:
+        if self.plan_window is not None and self.plan_window.winfo_exists():
+            self.plan_window.destroy()
+        self.plan_window = None
+        if hasattr(self, "tree"):
+            del self.tree
+
+    def _wheel_form(self, event: tk.Event) -> str:
+        # One wheel flick can deliver dozens of events. Apply them together so
+        # the form is redrawn once per frame instead of once per event.
+        self._wheel_pending += -event.delta / 120.0 * 72.0
+        if self._wheel_job is None:
+            self._wheel_job = self.after(16, self._apply_form_wheel)
+        return "break"
+
+    def _apply_form_wheel(self) -> None:
+        self._wheel_job = None
+        if not self.winfo_exists():
+            return
+        pixels = int(self._wheel_pending)
+        if pixels == 0:
+            return
+        self._wheel_pending -= pixels
+        self.form_canvas.yview_scroll(pixels, "units")
+        if abs(self._wheel_pending) >= 1:
+            self._wheel_job = self.after(16, self._apply_form_wheel)
+
+    def _wheel_widget(self, event: tk.Event) -> str:
+        widget = event.widget
+        try:
+            top, bottom = widget.yview()
+        except tk.TclError:
+            return self._wheel_form(event)
+        # A playlist box only uses the wheel when it has lines outside the view.
+        # Otherwise the page scrolls, including when the pointer is over that box.
+        if event.delta > 0:
+            can_scroll = top > 0.001
+        elif event.delta < 0:
+            can_scroll = bottom < 0.999
+        else:
+            can_scroll = False
+        if not can_scroll:
+            return self._wheel_form(event)
+        steps = int(-event.delta / 120)
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
+        widget.yview_scroll(steps, "units")
+        return "break"
+
+    def _bind_options(self) -> None:
+        for variable in (self.layout, self.strip_quality, self.drop_duplicate_strm, self.use_years, self.match_filenames):
+            variable.trace_add("write", self._on_option)
+        self.run_at_startup.trace_add("write", self._on_startup_toggle)
+        for variable in (self.auto_pull_playlists, self.auto_pull_emby, self.auto_apply_strm):
+            variable.trace_add("write", self._on_auto_option)
+        self.out_dir.trace_add("write", self._schedule_tags)
+        self.extra_tags.bind("<KeyRelease>", self._schedule_tags)
+        self.extra_tags.bind("<<Paste>>", self._schedule_tags)
+        self.filter_mode.trace_add("write", lambda *_args: self.fill_tree())
+        self.query.trace_add("write", lambda *_args: self.fill_tree())
+
+    def _schedule_tags(self, *_args: object) -> None:
+        if not self._ready:
+            return
+        if self._tag_job is not None:
+            self.after_cancel(self._tag_job)
+        self._tag_job = self.after(200, self._apply_tag_edit)
+
+    def _apply_tag_edit(self) -> None:
+        self._tag_job = None
+        if not self._ready:
+            return
+        self.build_plan()
+        self._save_settings()
+
+    def _on_option(self, *_args) -> None:
+        if not self._ready:
+            return
+        self._update_layout_hint()
+        self.build_plan()
+        self._save_settings()
+
+    def _on_auto_option(self, *_args: object) -> None:
+        if not self._ready:
+            return
+        self._save_settings()
+
+    def _on_startup_toggle(self, *_args: object) -> None:
+        if not self._ready:
+            return
+        message = apply_startup_registration(bool(self.run_at_startup.get()))
+        if message:
+            self._set_error(message)
+        self._save_settings()
+
+    def _sync_startup_registration(self) -> None:
+        if not self.run_at_startup.get():
+            return
+        message = apply_startup_registration(True)
+        if message:
+            self._set_error(message)
+
+    def _startup_auto(self) -> None:
+        if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
+            return
+        self._auto_note = ""
+        self._auto_queue = auto_steps(
+            bool(self.auto_pull_playlists.get()),
+            bool(self.auto_pull_emby.get()),
+            bool(self.auto_apply_strm.get()),
+        )
+        self._run_auto_next()
+
+    def _run_auto_next(self) -> None:
+        if not self._auto_queue or self._busy:
+            return
+        step = self._auto_queue.pop(0)
+        if step == "playlists":
+            self._auto_load_playlists()
+        elif step == "emby":
+            self._auto_pull_emby()
+        elif step == "apply":
+            self._auto_apply()
+
+    def _skip_auto_apply(self) -> None:
+        self._auto_queue = [step for step in self._auto_queue if step != "apply"]
+
+    def _continue_auto(self) -> None:
+        self.after(0, self._run_auto_next)
+
+    def _update_layout_hint(self) -> None:
+        self.layout_hint.set(LAYOUT_HINTS.get(self.layout.get(), LAYOUT_HINTS["group"]))
+
+    def _toggle_key(self) -> None:
+        self.api_entry.configure(show="" if self.show_key.get() else "•")
+
+    def _set_error(self, message: str) -> None:
+        if message:
+            self.error_label.configure(text=message)
+            if not self.error_host.winfo_manager():
+                self.error_host.pack(fill="x", padx=18, pady=(0, 8), before=self.form_host)
+        elif self.error_host.winfo_manager():
+            self.error_host.pack_forget()
+
+    def _set_busy(self, busy: bool) -> None:
+        state = ["disabled"] if busy else ["!disabled"]
+        for button in self._buttons:
+            button.state(state)
+
+    def _run(self, label: str, work, done) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._set_busy(True)
+        self._set_error("")
+        self.status.set(label)
+
+        def target() -> None:
+            try:
+                result = work()
+            except BaseException as exc:
+                message = explain(exc)
+                self.after(0, lambda message=message: self._finish_error(message))
+            else:
+                self.after(0, lambda result=result: self._finish_ok(done, result))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def _finish_error(self, message: str) -> None:
+        self._busy = False
+        self._set_busy(False)
+        self._set_error(message)
+        self.status.set("Ready")
+
+    def _finish_ok(self, done, result) -> None:
+        try:
+            done(result)
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            self.status.set("Ready")
+        finally:
+            self._busy = False
+            self._set_busy(False)
+
+    def _refresh_links(self) -> None:
+        self.link_list.delete(0, "end")
+        for link in self.links:
+            self.link_list.insert("end", link)
+
+    def _refresh_sources(self) -> None:
+        self.source_list.delete(0, "end")
+        for source in self.sources:
+            self.source_list.insert("end", f"{source['label']}  ({len(source['entries']):,})")
+
+    def _show_library(self) -> None:
+        if self.library is None:
+            self.library_status.set("No library loaded. Every stream will be kept.")
+        else:
+            self.library_status.set(self.library_label or f"{len(self.library):,} titles")
+
+    def add_link(self) -> None:
+        added = False
+        for line in self.link_entry.get().splitlines():
+            text = line.strip()
+            if text and text not in self.links:
+                self.links.append(text)
+                added = True
+        if not added and not self.link_entry.get().strip():
+            self._set_error("Enter a playlist link first.")
+            return
+        self.link_entry.set("")
+        self._refresh_links()
+        self._set_error("")
+        self._save_settings()
+
+    def remove_link(self) -> None:
+        selected = list(self.link_list.curselection())
+        if not selected:
+            return
+        for index in reversed(selected):
+            del self.links[index]
+        self._refresh_links()
+        self._save_settings()
+
+    def _read_source(self, source: str, kind: str) -> dict:
+        if source.startswith("http://") or source.startswith("https://"):
+            text = self.cleaner.fetch_text(source)
+            label = playlist_label(source)
+        else:
+            path = Path(source)
+            if not path.is_file():
+                raise ValueError(f"Cannot find {source}")
+            if path.stat().st_size > MAX_PLAYLIST_BYTES:
+                raise ValueError(f"{path.name} is over 80 MB.")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            label = path.name
+        if not looks_like_playlist(text):
+            raise ValueError("not an M3U playlist")
+        entries = self.cleaner.parse_m3u(text)
+        if not entries:
+            raise ValueError("no streams found")
+        payload = {"kind": kind, "label": label, "entries": entries}
+        if kind == "file":
+            payload["path"] = str(Path(source).resolve())
+        return payload
+
+    def _remember_playlist_file(self, path: str) -> None:
+        if path and path not in self.playlist_files:
+            self.playlist_files.append(path)
+
+    def add_files(self) -> None:
+        selected = filedialog.askopenfilenames(
+            parent=self,
+            title="Add playlist files",
+            filetypes=[("M3U playlists", "*.m3u *.m3u8 *.txt"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        paths = list(selected)
+
+        def work():
+            loaded = []
+            failures = []
+            for path in paths:
+                try:
+                    loaded.append(self._read_source(path, "file"))
+                except BaseException as exc:
+                    failures.append(f"{Path(path).name}: {explain(exc)}")
+            return loaded, failures
+
+        def done(result) -> None:
+            loaded, failures = result
+            if loaded:
+                kept = [source for source in self.sources if source["kind"] != "sample"]
+                self.sources = kept + loaded
+                for source in loaded:
+                    path = source.get("path")
+                    if isinstance(path, str):
+                        self._remember_playlist_file(path)
+                self._refresh_sources()
+                self.build_plan()
+                self._save_settings()
+            if failures:
+                self._set_error(" ".join(failures))
+            else:
+                self._set_error("")
+            count = len(loaded)
+            self.status.set(f"Loaded {count} playlist file{'s' if count != 1 else ''}." if count else "Ready")
+
+        self._run("Reading playlist files…", work, done)
+
+    def load_links(self) -> None:
+        self.add_link() if self.link_entry.get().strip() else None
+        urls = [link for link in self.links if link.strip()]
+        if not urls:
+            self._set_error("Add at least one playlist link.")
+            return
+
+        def work():
+            loaded = []
+            failures = []
+            for index, url in enumerate(urls, start=1):
+                self.after(0, lambda index=index, total=len(urls): self.status.set(f"Loading playlist {index} of {total}…"))
+                try:
+                    loaded.append(self._read_source(url, "url"))
+                except BaseException as exc:
+                    failures.append(f"{playlist_label(url)}: {explain(exc)}")
+            return loaded, failures
+
+        def done(result) -> None:
+            loaded, failures = result
+            if not loaded:
+                self._set_error(" ".join(failures) or "No playlists could be loaded.")
+                self.status.set("Ready")
+                return
+            files = [source for source in self.sources if source["kind"] == "file"]
+            self.sources = files + loaded
+            self._refresh_sources()
+            self.build_plan()
+            if failures:
+                self._set_error(f"Loaded {len(loaded)} of {len(urls)}. " + " ".join(failures))
+            else:
+                self._set_error("")
+            self.status.set(f"Loaded {len(loaded)} playlist link{'s' if len(loaded) != 1 else ''}.")
+
+        self._run("Loading playlists…", work, done)
+
+    def _auto_load_playlists(self) -> None:
+        urls = [link for link in self.links if link.strip()]
+        files = list(self.playlist_files)
+        if not urls and not files:
+            self._set_error("Add a playlist link or playlist file before automatic loading.")
+            self.status.set("Ready")
+            self._skip_auto_apply()
+            self._run_auto_next()
+            return
+
+        def work():
+            loaded_files = []
+            loaded_urls = []
+            failures = []
+            for path in files:
+                try:
+                    loaded_files.append(self._read_source(path, "file"))
+                except BaseException as exc:
+                    failures.append(f"{Path(path).name}: {explain(exc)}")
+            for index, url in enumerate(urls, start=1):
+                self.after(0, lambda index=index, total=len(urls): self.status.set(f"Loading playlist {index} of {total}…"))
+                try:
+                    loaded_urls.append(self._read_source(url, "url"))
+                except BaseException as exc:
+                    failures.append(f"{playlist_label(url)}: {explain(exc)}")
+            return loaded_files, loaded_urls, failures
+
+        def done(result) -> None:
+            loaded_files, loaded_urls, failures = result
+            loaded = loaded_files + loaded_urls
+            total = len(files) + len(urls)
+            if not loaded:
+                self._set_error(" ".join(failures) or "No playlists could be loaded.")
+                self.status.set("Ready")
+                self._skip_auto_apply()
+                self._continue_auto()
+                return
+            self.sources = loaded
+            self._refresh_sources()
+            self.build_plan()
+            if failures:
+                self._auto_note = f"Loaded {len(loaded)} of {total}. " + " ".join(failures)
+                self._set_error(self._auto_note)
+            else:
+                self._auto_note = ""
+                self._set_error("")
+            self.status.set(f"Loaded {len(loaded)} playlist{'s' if len(loaded) != 1 else ''}.")
+            self._continue_auto()
+
+        self._run("Loading playlists…", work, done)
+
+    def _auto_pull_emby(self) -> None:
+        base = self.emby.get().strip()
+        key = self.api_key.get().strip()
+        user = self.user_id.get().strip()
+        if not base or not key:
+            self._set_error("Enter the Emby server address and API key before automatic library updates.")
+            self.status.set("Ready")
+            self._skip_auto_apply()
+            self._run_auto_next()
+            return
+
+        def work():
+            return self.cleaner.fetch_emby(base, key, user)
+
+        def done(items) -> None:
+            if not items:
+                self._set_error("Emby returned no movies, shows, or episodes.")
+                self.status.set("Ready")
+                self._skip_auto_apply()
+                self._continue_auto()
+                return
+            self.library = items
+            suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
+            self.library_label = f"Emby · {len(items):,} items{suffix}"
+            self._show_library()
+            self.build_plan()
+            self._save_settings()
+            self._set_error(self._auto_note)
+            self.status.set(self.library_label)
+            self._continue_auto()
+
+        self._run("Reading Emby library…", work, done)
+
+    def _auto_apply(self) -> None:
+        if self.auto_pull_emby.get() and self.library is None:
+            self._set_error("The Emby library was not loaded, so the .strm folder was not changed.")
+            self.status.set("Ready")
+            return
+        if not self.planned:
+            self._set_error("No playlist is loaded, so the .strm folder was not changed.")
+            self.status.set("Ready")
+            return
+        try:
+            folder = self._out_path()
+            if folder is None:
+                return
+            removed = self._removal_count(folder)
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            self.status.set("Ready")
+            return
+        self._start_write(folder, removed, then_auto=True)
+
+    def remove_source(self) -> None:
+        selected = list(self.source_list.curselection())
+        if not selected:
+            return
+        for index in reversed(selected):
+            source = self.sources[index]
+            path = source.get("path")
+            if isinstance(path, str) and path in self.playlist_files:
+                self.playlist_files.remove(path)
+            del self.sources[index]
+        self._refresh_sources()
+        self.build_plan()
+        self._save_settings()
+
+    def pull_emby(self) -> None:
+        base = self.emby.get().strip()
+        key = self.api_key.get().strip()
+        user = self.user_id.get().strip()
+        if not base or not key:
+            self._set_error("Enter the Emby server address and API key.")
+            return
+
+        def work():
+            return self.cleaner.fetch_emby(base, key, user)
+
+        def done(items) -> None:
+            if not items:
+                self._set_error("Emby returned no movies, shows, or episodes.")
+                self.status.set("Ready")
+                return
+            self.library = items
+            suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
+            self.library_label = f"Emby · {len(items):,} items{suffix}"
+            self._show_library()
+            self.build_plan()
+            self._set_error("")
+            self.status.set(self.library_label)
+            self._save_settings()
+
+        self._run("Reading Emby library…", work, done)
+
+    def upload_library(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Upload library export",
+            filetypes=[("Library export", "*.json *.txt"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            if path.stat().st_size > MAX_PLAYLIST_BYTES:
+                raise ValueError(f"{path.name} is over 80 MB.")
+            items = parse_library_text(path.read_text(encoding="utf-8", errors="replace"), self.cleaner)
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            return
+        self.library = items
+        self.library_label = f"{path.name} · {len(items):,} titles"
+        self._show_library()
+        self.build_plan()
+        self._set_error("")
+        self.status.set(self.library_label)
+
+    def match_pasted(self) -> None:
+        try:
+            items = parse_library_text(self.paste.get("1.0", "end"), self.cleaner)
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            return
+        self.library = items
+        self.library_label = f"Pasted titles · {len(items):,}"
+        self._show_library()
+        self.build_plan()
+        self._set_error("")
+        self.status.set(self.library_label)
+
+    def clear_library(self) -> None:
+        self.library = None
+        self.library_label = ""
+        self._show_library()
+        self.build_plan()
+        self.status.set("Library cleared.")
+
+    def browse_out(self) -> None:
+        current = self.out_dir.get().strip()
+        initial = current if current and Path(current).is_dir() else str(app_dir())
+        selected = filedialog.askdirectory(parent=self, title="Save .strm files", initialdir=initial, mustexist=False)
+        if selected:
+            self.out_dir.set(selected)
+            self._save_settings()
+
+    def load_sample(self) -> None:
+        entries = self.cleaner.parse_m3u(SAMPLE_PLAYLIST)
+        self.sources = [{"kind": "sample", "label": "Sample playlist", "entries": entries}]
+        self.library = [dict(item) for item in SAMPLE_LIBRARY]
+        self.library_label = "Sample Emby library"
+        self._refresh_sources()
+        self._show_library()
+        self.filter_mode.set("All")
+        self.query.set("")
+        self.build_plan()
+        self._set_error("")
+        self.status.set("Sample loaded. Dune (1984) and The Office S01E03 stay. The Matrix (1999) is left out.")
+
+    def _plan_options(self) -> dict:
+        layout = self.layout.get()
+        if layout not in {"group", "flat", "library"}:
+            layout = "group"
+        return {
+            "layout": layout,
+            "strip_quality": bool(self.strip_quality.get()),
+            "use_years": bool(self.use_years.get()),
+            "match_filenames": bool(self.match_filenames.get()),
+            "extra_tags": self.extra_tags.get("1.0", "end"),
+            "drop_duplicate_strm": bool(self.drop_duplicate_strm.get()),
+            "out": self._plan_out(),
+        }
+
+    def _plan_out(self) -> str:
+        raw = self.out_dir.get().strip()
+        if not raw:
+            return ""
+        path = Path(raw)
+        if not path.is_absolute():
+            path = app_dir() / path
+        return str(path)
+
+    def build_plan(self) -> None:
+        entries = [entry for source in self.sources for entry in source["entries"]]
+        if not entries:
+            self.planned = []
+            self.fill_tree()
+            return
+        planned = self.cleaner.plan_entries(entries, self.library, self._plan_options())
+        for entry, row in zip(entries, planned):
+            row["group"] = entry.get("group") or ""
+        self.planned = planned
+        self.fill_tree()
+
+    def _visible_rows(self) -> list[dict]:
+        mode = self.filter_mode.get()
+        needle = self.query.get().strip().lower()
+        rows = []
+        for row in self.planned:
+            if mode == "New files" and row["disposition"] != "keep":
+                continue
+            if mode == "Left out" and row["disposition"] == "keep":
+                continue
+            if needle:
+                haystack = " ".join(
+                    [row.get("title", ""), row.get("path", ""), row.get("reason", ""), row.get("group", "")]
+                ).lower()
+                if needle not in haystack:
+                    continue
+            rows.append(row)
+        return rows
+
+    def fill_tree(self) -> None:
+        visible = self._visible_rows()
+        self._update_summary(len(visible))
+        tree = getattr(self, "tree", None)
+        if tree is None or not tree.winfo_exists():
+            return
+        self.tree.delete(*self.tree.get_children())
+        for index, row in enumerate(visible[:TREE_LIMIT]):
+            plan = "New" if row["disposition"] == "keep" else "Leave out"
+            tag = "keep" if row["disposition"] == "keep" else "drop"
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(row["title"], row["path"], plan, row.get("reason", "")),
+                tags=(tag,),
+            )
+
+    def _update_summary(self, shown: int) -> None:
+        if not self.planned:
+            self.summary.set("Load a playlist to see the plan.")
+            return
+        kept = sum(1 for row in self.planned if row["disposition"] == "keep")
+        dropped = len(self.planned) - kept
+        text = f"{len(self.planned):,} playlist entries · {kept:,} new · {dropped:,} left out"
+        if self.library is None:
+            text += " · no Emby library loaded"
+        elif self.library_label:
+            text += f" · {self.library_label}"
+        if shown != len(self.planned):
+            text += f" · {shown:,} shown"
+        if shown > TREE_LIMIT:
+            text += f" · first {TREE_LIMIT:,} rows"
+        self.summary.set(text)
+
+    def _out_path(self) -> Path | None:
+        raw = self.out_dir.get().strip()
+        if not raw:
+            self._set_error("Choose the folder where the .strm files should be written.")
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = app_dir() / path
+        return path
+
+    def _source_label(self) -> str:
+        if not self.sources:
+            return ""
+        if len(self.sources) <= 2:
+            return " · ".join(source["label"] for source in self.sources)
+        return f"{len(self.sources)} playlists"
+
+    def _removal_count(self, folder: Path) -> int:
+        removed = 0
+        for row in self.planned:
+            if row["disposition"] == "keep":
+                continue
+            target = self.cleaner.inside(folder, row["path"])
+            if target.is_file():
+                removed += 1
+        return removed
+
+    def write_files(self) -> None:
+        if self._busy:
+            return
+        if not self.planned:
+            self._set_error("Load a playlist first.")
+            return
+        try:
+            folder = self._out_path()
+            if folder is None:
+                return
+            removed = self._removal_count(folder)
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            return
+        kept = sum(1 for row in self.planned if row["disposition"] == "keep")
+        message = f"Write {kept:,} .strm files to\n{folder}?"
+        if removed:
+            message += (
+                f"\n\n{removed:,} existing files in that folder will be deleted because they are already in Emby "
+                "or are duplicate streams."
+            )
+        else:
+            message += "\n\nNo existing files in that folder will be deleted."
+        if self.library is None:
+            warning = "No Emby library is loaded, so every stream is treated as new."
+            if self.emby.get().strip() or self.api_key.get().strip():
+                warning = "The Emby library has not been pulled, so nothing will be left out as a duplicate."
+            message += f"\n\n{warning}"
+        if not messagebox.askyesno("Write .strm files", message, parent=self):
+            return
+        self._start_write(folder, removed, then_auto=False)
+
+    def _start_write(self, folder: Path, removed: int, *, then_auto: bool) -> None:
+        planned = self.planned
+        kept = sum(1 for row in self.planned if row["disposition"] == "keep")
+
+        def work():
+            folder.mkdir(parents=True, exist_ok=True)
+            self.cleaner.write_plan(folder, planned, True)
+            return kept, removed
+
+        def done(result) -> None:
+            written, deleted = result
+            extra = f" Removed {deleted:,} files that were already in the folder." if deleted else ""
+            if self._auto_note:
+                self._set_error(self._auto_note)
+            else:
+                self._set_error("")
+            self.status.set(f"Wrote {written:,} .strm files to {folder}.{extra}")
+            self._save_settings()
+            if then_auto:
+                self._continue_auto()
+
+        self._run("Writing .strm files…", work, done)
+
+    def save_report(self) -> None:
+        if not self.planned:
+            self._set_error("Load a playlist first.")
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save report",
+            defaultextension=".txt",
+            initialfile="nimbovod-report.txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        text = report_text(self.planned, self._source_label(), self.library is not None)
+        Path(selected).write_text(text, encoding="utf-8")
+        self._set_error("")
+        self.status.set(f"Saved the report to {selected}")
+
+    def _collect_settings(self) -> dict:
+        return {
+            "links": self.links,
+            "out": self.out_dir.get(),
+            "emby": self.emby.get(),
+            "apiKey": self.api_key.get(),
+            "userId": self.user_id.get(),
+            "layout": self.layout.get(),
+            "stripQuality": bool(self.strip_quality.get()),
+            "useYears": bool(self.use_years.get()),
+            "matchFilenames": bool(self.match_filenames.get()),
+            "dropDuplicateStrm": bool(self.drop_duplicate_strm.get()),
+            "extraTags": self.extra_tags.get("1.0", "end").strip(),
+            "playlistFiles": list(self.playlist_files),
+            "runAtStartup": bool(self.run_at_startup.get()),
+            "autoPullPlaylists": bool(self.auto_pull_playlists.get()),
+            "autoPullEmby": bool(self.auto_pull_emby.get()),
+            "autoApplyStrm": bool(self.auto_apply_strm.get()),
+            "geometry": self.geometry(),
+        }
+
+    def _save_settings(self) -> None:
+        if not self._ready:
+            return
+        path = settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._collect_settings(), indent=2), encoding="utf-8")
+
+    def _load_settings(self) -> None:
+        path = settings_path()
+        if not path.is_file():
+            return
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(saved, dict):
+            return
+        links = saved.get("links")
+        if isinstance(links, list):
+            self.links = [item.strip() for item in links if isinstance(item, str) and item.strip()]
+            self._refresh_links()
+        for key, variable in (
+            ("out", self.out_dir),
+            ("emby", self.emby),
+            ("apiKey", self.api_key),
+            ("userId", self.user_id),
+        ):
+            if isinstance(saved.get(key), str):
+                variable.set(saved[key])
+        if saved.get("layout") in {"group", "flat", "library"}:
+            self.layout.set(saved["layout"])
+        for key, variable in (
+            ("stripQuality", self.strip_quality),
+            ("useYears", self.use_years),
+            ("matchFilenames", self.match_filenames),
+            ("dropDuplicateStrm", self.drop_duplicate_strm),
+            ("runAtStartup", self.run_at_startup),
+            ("autoPullPlaylists", self.auto_pull_playlists),
+            ("autoPullEmby", self.auto_pull_emby),
+            ("autoApplyStrm", self.auto_apply_strm),
+        ):
+            if isinstance(saved.get(key), bool):
+                variable.set(1 if saved[key] else 0)
+        files = saved.get("playlistFiles")
+        if isinstance(files, list):
+            self.playlist_files = []
+            for item in files:
+                if isinstance(item, str) and item.strip():
+                    self._remember_playlist_file(item.strip())
+        extra_tags = saved.get("extraTags")
+        if isinstance(extra_tags, str) and extra_tags.strip():
+            self.extra_tags.insert("1.0", extra_tags.strip())
+        elif isinstance(extra_tags, list):
+            lines = [item.strip() for item in extra_tags if isinstance(item, str) and item.strip()]
+            if lines:
+                self.extra_tags.insert("1.0", "\n".join(lines))
+        geometry = saved.get("geometry")
+        if isinstance(geometry, str) and "x" in geometry:
+            self.geometry(geometry)
+
+    def _on_close(self) -> None:
+        if self._wheel_job is not None:
+            self.after_cancel(self._wheel_job)
+            self._wheel_job = None
+        pending = self.link_entry.get().strip()
+        if pending:
+            self.add_link()
+        self._ready = True
+        self._save_settings()
+        self.destroy()
+
+
+def self_check() -> None:
+    cleaner = load_cleaner()
+    pasted = parse_library_text("The Matrix (1999)\nThe Office S01E01\n", cleaner)
+    assert pasted[0]["type"] == "Movie"
+    assert pasted[1]["type"] == "Episode" and pasted[1]["episode"] == 1
+    exported = parse_library_text(json.dumps({"items": SAMPLE_LIBRARY}), cleaner)
+    assert len(exported) == len(SAMPLE_LIBRARY)
+    entries = cleaner.parse_m3u(SAMPLE_PLAYLIST)
+    planned = cleaner.plan_entries(
+        entries,
+        SAMPLE_LIBRARY,
+        {"layout": "group", "strip_quality": True, "use_years": True, "match_filenames": True},
+    )
+    by_title: dict[str, list[str]] = {}
+    for row in planned:
+        by_title.setdefault(row["title"], []).append(row["disposition"])
+    assert by_title["The Matrix (1999)"] == ["drop", "drop"]
+    assert by_title["Dune (1984)"] == ["keep"]
+    assert by_title["Dune (2021)"] == ["drop"]
+    assert by_title["The Office S01E01"] == ["drop"]
+    assert by_title["The Office S01E03"] == ["keep"]
+    assert by_title["Blade Runner 2049"] == ["keep"]
+    assert by_title["City News"] == ["keep"]
+    tagged = cleaner.parse_m3u(
+        '#EXTM3U\n#EXTINF:-1 group-title="Movies",The Matrix YTS 1080p\nhttps://example.com/yts\n'
+    )
+    tagged_plan = cleaner.plan_entries(
+        tagged,
+        [{"name": "The Matrix", "year": 1999, "type": "Movie"}],
+        {
+            "layout": "flat",
+            "strip_quality": True,
+            "use_years": True,
+            "match_filenames": False,
+            "extra_tags": "YTS",
+        },
+    )
+    assert tagged_plan[0]["path"] == "The Matrix.strm"
+    assert tagged_plan[0]["disposition"] == "drop"
+
+    import tempfile
+
+    assert auto_steps(True, True, True) == ["playlists", "emby", "apply"]
+    assert auto_steps(False, False, False) == []
+    assert auto_steps(False, True, True) == ["emby", "apply"]
+    handle = tempfile.NamedTemporaryFile(prefix="nimbovod-settings-", suffix=".json", delete=False)
+    handle.close()
+    os.environ["NIMBOVOD_SETTINGS"] = handle.name
+    Path(handle.name).write_text(
+        json.dumps(
+            {
+                "runAtStartup": True,
+                "autoPullPlaylists": True,
+                "autoPullEmby": True,
+                "autoApplyStrm": True,
+                "playlistFiles": [r"C:\playlists\test.m3u"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    startup_before = read_startup_command()
+    app = None
+    try:
+        app = App()
+        app.withdraw()
+        assert not startup_registration_allowed()
+        assert read_startup_command() == startup_before
+        apply_startup_registration(True)
+        apply_startup_registration(False)
+        assert read_startup_command() == startup_before
+        app._startup_auto()
+        assert app._auto_queue == []
+        assert not app._busy
+        assert app.run_at_startup.get() == 1
+        assert app.auto_pull_playlists.get() == 1
+        assert app.auto_pull_emby.get() == 1
+        assert app.auto_apply_strm.get() == 1
+        assert app.playlist_files == [r"C:\playlists\test.m3u"]
+        collected = app._collect_settings()
+        assert collected["runAtStartup"] is True
+        assert collected["autoPullPlaylists"] is True
+        assert collected["autoPullEmby"] is True
+        assert collected["autoApplyStrm"] is True
+        assert collected["playlistFiles"] == [r"C:\playlists\test.m3u"]
+        wheel = type("Wheel", (), {"delta": -120})()
+        app._wheel_form(wheel)
+        app._wheel_form(wheel)
+        assert app._wheel_job is not None
+        assert app._wheel_pending == 144
+        app.after_cancel(app._wheel_job)
+        app._apply_form_wheel()
+        assert app._wheel_job is None
+        assert app._wheel_pending == 0
+        over_list = type("Wheel", (), {"delta": -120, "widget": app.link_list})()
+        app._wheel_widget(over_list)
+        assert app._wheel_pending == 72
+        app.after_cancel(app._wheel_job)
+        app._wheel_job = None
+        app._wheel_pending = 0.0
+        for index in range(20):
+            app.link_list.insert("end", f"playlist {index}")
+        app.update_idletasks()
+        before = app.link_list.yview()[0]
+        app._wheel_widget(type("Wheel", (), {"delta": -120, "widget": app.link_list})())
+        assert app.link_list.yview()[0] > before
+        assert app._wheel_pending == 0
+        app.link_list.delete(0, "end")
+        app.load_sample()
+        app.show_plan()
+        app.update()
+        children = app.tree.get_children()
+        assert children, "sample plan did not fill the list"
+        app.sources = [{"kind": "file", "label": "tagged", "entries": tagged}]
+        app.library = [{"name": "The Matrix", "year": 1999, "type": "Movie"}]
+        app.extra_tags.delete("1.0", "end")
+        app.extra_tags.insert("1.0", "YTS")
+        app.layout.set("flat")
+        app.build_plan()
+        assert app.planned[0]["path"] == "The Matrix.strm", app.planned[0]["path"]
+        assert "left out" in app.summary.get()
+        assert app.tree.item(children[0], "values")[2] in {"New", "Leave out"}
+    finally:
+        if app is not None:
+            app.destroy()
+        Path(handle.name).unlink(missing_ok=True)
+        os.environ.pop("NIMBOVOD_SETTINGS", None)
+    print("gui self-check ok")
+
+
+def main() -> None:
+    ensure_stdio()
+    enable_dpi()
+    if "--self-check" in sys.argv:
+        try:
+            self_check()
+        except Exception:
+            import traceback
+
+            log = Path(os.environ.get("TEMP", ".")) / "nimbovod-self-check.txt"
+            log.write_text(traceback.format_exc(), encoding="utf-8")
+            raise
+        return
+    try:
+        app = App()
+    except Exception as exc:
+        ensure_stdio()
+        print(explain(exc), file=sys.stderr)
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("NimboVoD", explain(exc))
+            root.destroy()
+        except Exception:
+            pass
+        raise SystemExit(1)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

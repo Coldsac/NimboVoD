@@ -27,13 +27,62 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+QUALITY_TAGS = (
+    "2160p",
+    "1080p",
+    "720p",
+    "576p",
+    "480p",
+    "4k",
+    "uhd",
+    "hdr10",
+    "hdr",
+    "dv",
+    "dolby vision",
+    "web-dl",
+    "webrip",
+    "bluray",
+    "blu-ray",
+    "bdrip",
+    "brrip",
+    "dvdrip",
+    "hdtv",
+    "hdrip",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "hevc",
+    "aac",
+    "dts-hd",
+    "dts",
+    "atmos",
+    "truehd",
+    "remux",
+    "proper",
+    "repack",
+    "extended",
+    "unrated",
+    "amzn",
+    "nf",
+    "hmax",
+    "[WEB]",
+    "[x265]",
+    "[x264]",
+    "[TS]",
+    "Megusta",
+    "[ ]",
+)
 QUALITY = re.compile(
-    r"\b(?:2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby(?:\s*vision)?|"
+    r"\[\s*(?:web|x26[45]|ts)\s*\]"
+    r"|\[\s*\]"
+    r"|\b(?:2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby(?:\s*vision)?|"
     r"web-?dl|web-?rip|bluray|blu-ray|bdrip|brrip|dvdrip|hdtv|hdrip|x264|x265|"
     r"h\.?264|h\.?265|hevc|aac|dts(?:-hd)?|atmos|truehd|remux|proper|repack|"
-    r"extended|unrated|amzn|nf|hmax)\b",
+    r"extended|unrated|amzn|nf|hmax|megusta)\b",
     re.I,
 )
+EMPTY_BRACKETS = re.compile(r"\[\s*\]")
 YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 EPISODE = re.compile(
     r"^(.*?)\s+(?:s(\d{1,2})\s*e(\d{1,3})|(\d{1,2})x(\d{2,3}))\b\s*(.*)$",
@@ -45,17 +94,49 @@ PAGE_SIZE = 400
 ITEM_LIMIT = 30000
 
 
-def strip_quality(value: str) -> str:
-    return re.sub(r"\s+", " ", QUALITY.sub(" ", value).replace(".", " ").replace("_", " ")).strip()
+def compile_extra_tags(tags: object) -> re.Pattern[str] | None:
+    parts: list[str] = []
+    if isinstance(tags, str):
+        parts = re.split(r"[\n,;]+", tags)
+    elif isinstance(tags, (list, tuple)):
+        for item in tags:
+            if isinstance(item, str):
+                parts.extend(re.split(r"[\n,;]+", item))
+    escaped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        tag = part.strip()
+        if len(tag) < 2:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        escaped.append((tag, re.escape(tag).replace(r"\ ", r"\s+")))
+    if not escaped:
+        return None
+    escaped.sort(key=lambda item: len(item[0]), reverse=True)
+    body = "|".join(token for _tag, token in escaped)
+    return re.compile(rf"(?<![A-Za-z0-9])(?:{body})(?![A-Za-z0-9])", re.I)
 
 
-def normalize_title(value: str) -> tuple[str, int | None]:
+def strip_quality(value: str, extra: re.Pattern[str] | None = None) -> str:
+    text = QUALITY.sub(" ", value)
+    if extra is not None:
+        text = extra.sub(" ", text)
+    text = EMPTY_BRACKETS.sub(" ", text)
+    return re.sub(r"\s+", " ", text.replace(".", " ").replace("_", " ")).strip()
+
+
+def normalize_title(value: str, extra: re.Pattern[str] | None = None) -> tuple[str, int | None]:
     years = [int(match.group(0)) for match in YEAR.finditer(value)]
     year = years[-1] if years else None
     text = value
     text = re.sub(r"\[[^\]]*\]", " ", text)
     text = re.sub(r"\([^)]*\)", " ", text)
     text = QUALITY.sub(" ", text)
+    if extra is not None:
+        text = extra.sub(" ", text)
     text = text.lower().replace("&", " and ")
     text = re.sub(r"['’`]", "", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
@@ -67,8 +148,8 @@ def normalize_title(value: str) -> tuple[str, int | None]:
     return text, year
 
 
-def parse_episode(title: str) -> tuple[str, int, int, str] | None:
-    match = EPISODE.match(strip_quality(title))
+def parse_episode(title: str, extra: re.Pattern[str] | None = None) -> tuple[str, int, int, str] | None:
+    match = EPISODE.match(strip_quality(title, extra))
     if not match:
         return None
     show = (match.group(1) or "").strip()
@@ -128,13 +209,13 @@ def safe_segment(name: str) -> str:
     return cleaned
 
 
-def relative_path(entry: dict, layout: str, strip: bool) -> str:
-    title = strip_quality(entry["title"]) if strip else re.sub(r"\s+", " ", entry["title"]).strip()
+def relative_path(entry: dict, layout: str, strip: bool, extra: re.Pattern[str] | None = None) -> str:
+    title = strip_quality(entry["title"], extra) if strip else re.sub(r"\s+", " ", entry["title"]).strip()
     title = title or entry["title"] or "Untitled"
     if layout == "flat":
         return f"{safe_segment(title)}.strm"
     if layout == "library":
-        episode = parse_episode(title)
+        episode = parse_episode(title, extra)
         if episode:
             show, season, number, rest = episode
             label = (
@@ -182,7 +263,11 @@ def find_match(index: dict[str, list[dict]], key: str, year: int | None, use_yea
     return None
 
 
-def index_library(items: list[dict], match_filenames: bool) -> tuple[dict, dict, dict, dict]:
+def index_library(
+    items: list[dict],
+    match_filenames: bool,
+    extra: re.Pattern[str] | None = None,
+) -> tuple[dict, dict, dict, dict]:
     movies: dict[str, list[dict]] = {}
     series: dict[str, list[dict]] = {}
     episodes: dict[str, list[dict]] = {}
@@ -192,7 +277,7 @@ def index_library(items: list[dict], match_filenames: bool) -> tuple[dict, dict,
         if not name:
             continue
         kind = str(item.get("type") or item.get("Type") or "Other")
-        named_key, named_year = normalize_title(name)
+        named_key, named_year = normalize_title(name, extra)
         year = item.get("year", item.get("ProductionYear", named_year))
         year = int(year) if isinstance(year, int) or (isinstance(year, str) and year.isdigit()) else named_year
         label = f"{kind} \"{name}\"" + (f" ({year})" if year else "")
@@ -202,7 +287,7 @@ def index_library(items: list[dict], match_filenames: bool) -> tuple[dict, dict,
             remember(series, named_key, label, year)
         elif kind == "Episode":
             show_name = str(item.get("seriesName") or item.get("SeriesName") or "")
-            show_key, _show_year = normalize_title(show_name)
+            show_key, _show_year = normalize_title(show_name, extra)
             season = item.get("season", item.get("ParentIndexNumber"))
             episode = item.get("episode", item.get("IndexNumber"))
             if show_key and isinstance(season, int) and isinstance(episode, int):
@@ -210,20 +295,57 @@ def index_library(items: list[dict], match_filenames: bool) -> tuple[dict, dict,
         path = item.get("path") or item.get("Path")
         if match_filenames and isinstance(path, str) and path.strip():
             base = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", path.replace("\\", "/").split("/")[-1])
-            file_key, file_year = normalize_title(base)
+            file_key, file_year = normalize_title(base, extra)
             remember(filenames, file_key, label, year if isinstance(year, int) else file_year)
     return movies, series, episodes, filenames
 
 
+def disk_duplicate_rows(folder: Path, planned: list[dict]) -> list[dict]:
+    if not folder.is_dir():
+        return []
+    known = {row["path"].replace("\\", "/").lower() for row in planned}
+    found: list[dict] = []
+    for row in planned:
+        if row["disposition"] != "keep":
+            continue
+        relative = Path(row["path"].replace("\\", "/"))
+        parent = folder / relative.parent
+        if not parent.is_dir():
+            continue
+        pattern = re.compile(rf"^{re.escape(relative.stem)} \((\d+)\){re.escape(relative.suffix)}$", re.I)
+        for child in parent.iterdir():
+            match = pattern.match(child.name)
+            if not child.is_file() or match is None or int(match.group(1)) < 2:
+                continue
+            sibling = (relative.parent / child.name).as_posix()
+            if sibling.lower() in known:
+                continue
+            known.add(sibling.lower())
+            found.append(
+                {
+                    "title": child.stem,
+                    "url": "",
+                    "path": sibling,
+                    "group": "",
+                    "disposition": "drop",
+                    "reason": "Duplicate .strm file already in the folder",
+                }
+            )
+    return found
+
+
 def plan_entries(entries: list[dict], library: list[dict] | None, options: dict) -> list[dict]:
+    extra = compile_extra_tags(options.get("extra_tags"))
+    drop_duplicate_strm = bool(options.get("drop_duplicate_strm", True))
     movies, series, episodes, filenames = (
-        index_library(library, options["match_filenames"]) if library is not None else ({}, {}, {}, {})
+        index_library(library, options["match_filenames"], extra) if library is not None else ({}, {}, {}, {})
     )
     used: set[str] = set()
     seen: set[str] = set()
     planned: list[dict] = []
     for entry in entries:
-        path = unique_path(relative_path(entry, options["layout"], options["strip_quality"]), used)
+        natural = relative_path(entry, options["layout"], options["strip_quality"], extra)
+        path = natural if drop_duplicate_strm else unique_path(natural, used)
         url = entry["url"].strip()
         row = {"title": entry["title"], "url": url, "path": path, "disposition": "keep", "reason": ""}
         if url in seen:
@@ -232,20 +354,28 @@ def plan_entries(entries: list[dict], library: list[dict] | None, options: dict)
             planned.append(row)
             continue
         seen.add(url)
+        if drop_duplicate_strm:
+            key = natural.lower()
+            if key in used:
+                row["disposition"] = "drop"
+                row["reason"] = "Duplicate .strm file"
+                planned.append(row)
+                continue
+            used.add(key)
         if library is None:
             planned.append(row)
             continue
-        cleaned = strip_quality(entry["title"]) if options["strip_quality"] else entry["title"]
-        episode = parse_episode(cleaned)
+        cleaned = strip_quality(entry["title"], extra) if options["strip_quality"] else entry["title"]
+        episode = parse_episode(cleaned, extra)
         reason = ""
         if episode:
             show, season, number, _rest = episode
-            show_key, _year = normalize_title(show)
+            show_key, _year = normalize_title(show, extra)
             hit = (episodes.get(f"{show_key}|{season}|{number}") or [None])[0]
             if hit:
                 reason = f"Already in Emby · {hit['label']}"
         else:
-            key, year = normalize_title(cleaned)
+            key, year = normalize_title(cleaned, extra)
             hit = (
                 find_match(movies, key, year, options["use_years"])
                 or find_match(series, key, year, options["use_years"])
@@ -261,6 +391,10 @@ def plan_entries(entries: list[dict], library: list[dict] | None, options: dict)
             row["disposition"] = "drop"
             row["reason"] = reason
         planned.append(row)
+    if drop_duplicate_strm:
+        raw_out = str(options.get("out") or "").strip()
+        if raw_out:
+            planned.extend(disk_duplicate_rows(Path(raw_out), planned))
     return planned
 
 
@@ -356,7 +490,10 @@ def inside(root: Path, relative: str) -> Path:
 def write_plan(out: Path, planned: list[dict], apply: bool) -> None:
     removed = 0
     written = 0
+    kept_paths = {row["path"].replace("\\", "/").lower() for row in planned if row["disposition"] == "keep"}
     for row in planned:
+        if row["disposition"] != "keep" and row["path"].replace("\\", "/").lower() in kept_paths:
+            continue
         target = inside(out, row["path"])
         if row["disposition"] == "keep":
             if apply:
@@ -488,6 +625,56 @@ def self_test() -> None:
     assert by_title["The Matrix (1999)"] == "drop", by_title
     assert source_list("https://example.com/a.m3u") == ["https://example.com/a.m3u"]
     assert source_list([" https://a ", "", "https://b"]) == ["https://a", "https://b"]
+    extra = compile_extra_tags("YTS, RARBG")
+    assert strip_quality("The.Matrix.YTS.1080p", extra) == "The Matrix"
+    tagged = parse_m3u(
+        '#EXTM3U\n#EXTINF:-1 group-title="Movies",The Matrix YTS 1080p\nhttps://example.com/yts\n'
+    )
+    tagged_plan = plan_entries(
+        tagged,
+        [{"name": "The Matrix", "year": 1999, "type": "Movie"}],
+        {
+            "layout": "flat",
+            "strip_quality": True,
+            "use_years": True,
+            "match_filenames": False,
+            "extra_tags": ["YTS"],
+        },
+    )
+    assert tagged_plan[0]["path"] == "The Matrix.strm", tagged_plan[0]
+    assert tagged_plan[0]["disposition"] == "drop", tagged_plan[0]
+    assert strip_quality("Movie [WEB] [x265] [x264] [TS] Megusta [ ]") == "Movie"
+    assert strip_quality("Movie [1080p]") == "Movie"
+    assert normalize_title("Movie Megusta")[0] == "movie"
+    copies = parse_m3u(
+        "#EXTM3U\n"
+        '#EXTINF:-1 group-title="Movies",Movie [WEB] Megusta\nhttps://example.com/one\n'
+        '#EXTINF:-1 group-title="Movies",Movie [x265]\nhttps://example.com/two\n'
+    )
+    duplicate_plan = plan_entries(
+        copies,
+        None,
+        {"layout": "flat", "strip_quality": True, "drop_duplicate_strm": True},
+    )
+    assert duplicate_plan[0]["path"] == "Movie.strm" and duplicate_plan[0]["disposition"] == "keep"
+    assert duplicate_plan[1]["disposition"] == "drop" and duplicate_plan[1]["reason"] == "Duplicate .strm file"
+    kept_plan = plan_entries(
+        copies,
+        None,
+        {"layout": "flat", "strip_quality": True, "drop_duplicate_strm": False},
+    )
+    assert kept_plan[1]["path"] == "Movie (2).strm" and kept_plan[1]["disposition"] == "keep"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        (folder / "Movie (2).strm").write_text("old\n", encoding="utf-8")
+        with_disk = plan_entries(
+            copies[:1],
+            None,
+            {"layout": "flat", "strip_quality": True, "drop_duplicate_strm": True, "out": directory},
+        )
+        assert any(row["path"] == "Movie (2).strm" and row["disposition"] == "drop" for row in with_disk)
     print("self-test ok")
 
 
@@ -509,6 +696,17 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="Write files and delete duplicates. Omit for a dry run.")
     parser.add_argument("--ignore-years", action="store_true", help="Match titles even when years differ")
     parser.add_argument("--keep-quality", action="store_true", help="Keep quality tags in file names")
+    parser.add_argument(
+        "--keep-duplicate-strm",
+        action="store_true",
+        help="Keep a second .strm when two streams clean up to the same file name.",
+    )
+    parser.add_argument(
+        "--strip-tag",
+        action="append",
+        dest="strip_tags",
+        help="Extra tag to remove from names, along with the quality tags. Repeat for each tag.",
+    )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.self_test:
@@ -530,6 +728,13 @@ def main() -> None:
     strip_quality = False if args.keep_quality else bool(config.get("stripQuality", True))
     use_years = False if args.ignore_years else bool(config.get("useYears", True))
     match_filenames = bool(config.get("matchFilenames", True))
+    extra_tags: list[str] = list(args.strip_tags or [])
+    configured_tags = config.get("extraTags")
+    if isinstance(configured_tags, str):
+        extra_tags.append(configured_tags)
+    elif isinstance(configured_tags, list):
+        extra_tags.extend(item for item in configured_tags if isinstance(item, str))
+    drop_duplicate_strm = not args.keep_duplicate_strm and bool(config.get("dropDuplicateStrm", True))
 
     if args.export:
         if not emby or not api_key:
@@ -561,6 +766,9 @@ def main() -> None:
             "strip_quality": strip_quality,
             "use_years": use_years,
             "match_filenames": match_filenames,
+            "extra_tags": extra_tags,
+            "drop_duplicate_strm": drop_duplicate_strm,
+            "out": str(out).strip(),
         },
     )
     write_plan(Path(out), planned, args.apply)
