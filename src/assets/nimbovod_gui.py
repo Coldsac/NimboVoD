@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -437,6 +438,10 @@ class App(tk.Tk):
         self._wheel_job: str | None = None
         self._wheel_pending = 0.0
         self._refresh_job: str | None = None
+        self._startup_job: str | None = None
+        self._ui_thread = threading.current_thread()
+        self._ui_calls: queue.Queue = queue.Queue()
+        self._auto_running = False
         self.links: list[str] = []
         self.playlist_files: list[str] = []
         self.sources: list[dict] = []
@@ -462,6 +467,7 @@ class App(tk.Tk):
         self._update_layout_hint()
         self._sync_startup_registration()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(30, self._poll_ui_calls)
         self.after(400, self._startup_auto)
 
     def _init_vars(self) -> None:
@@ -815,10 +821,11 @@ class App(tk.Tk):
         ttk.Label(
             settings,
             text=(
-                "Checked steps run when NimboVoD opens. A number of minutes runs them again on a timer. "
-                "Leave it blank to refresh only when the program opens. Playlists are the saved links and local "
-                "playlist files. Emby uses the saved address and API key. The folder then gains new .strm files and "
-                "loses ones the plan leaves out. Other files in the folder are left alone. Updating the folder does not ask again."
+                "Checked steps run when NimboVoD opens, one at a time: playlists finish, then the Emby library, "
+                "then the .strm folder. A number of minutes runs that same sequence again. Leave it blank to refresh "
+                "only when the program opens. Playlists are the saved links and local playlist files. Emby uses the "
+                "saved address and API key. The folder then gains new .strm files and loses ones the plan leaves out. "
+                "Other files in the folder are left alone. Updating the folder does not ask again."
             ),
             style="CardMuted.TLabel",
             wraplength=400,
@@ -1177,12 +1184,15 @@ class App(tk.Tk):
             return
         # Paint the window before refreshing. A restart can launch NimboVoD
         # before the network is up, and a pull at that moment looks frozen.
-        self.after(1200, self._begin_startup_auto)
+        if self._startup_job is not None:
+            self.after_cancel(self._startup_job)
+        self._startup_job = self.after(1200, self._begin_startup_auto)
 
     def _begin_startup_auto(self) -> None:
+        self._startup_job = None
         if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
             return
-        if not self.winfo_exists() or self._busy or self._auto_queue:
+        if not self.winfo_exists() or self._busy or self._auto_running or self._auto_queue:
             return
         steps = auto_steps(
             bool(self.auto_pull_playlists.get()),
@@ -1192,12 +1202,260 @@ class App(tk.Tk):
         if not steps:
             self._schedule_refresh()
             return
-        hosts = self._refresh_hosts(steps)
-        if not hosts:
-            self._start_auto_steps(steps)
+        snapshot = self._auto_snapshot(steps)
+        self._auto_running = True
+        self._busy = True
+        self._set_busy(True)
+        self._auto_queue = list(steps)
+        self._auto_note = ""
+        self._set_error("")
+        if snapshot["hosts"]:
+            self.status.set("Waiting for the network…")
+        elif steps[0] == "playlists":
+            self.status.set("Updating playlists…")
+        elif steps[0] == "emby":
+            self.status.set("Updating Emby library…")
+        else:
+            self.status.set("Updating .strm files…")
+        threading.Thread(target=self._auto_pipeline, args=(snapshot,), daemon=True).start()
+
+    def _auto_snapshot(self, steps: list[str]) -> dict:
+        """Copy the inputs a refresh needs. The worker must not read the widgets."""
+        return {
+            "steps": list(steps),
+            "urls": [link for link in self.links if link.strip()] if "playlists" in steps else [],
+            "files": list(self.playlist_files) if "playlists" in steps else [],
+            "emby": self.emby.get().strip(),
+            "api_key": self.api_key.get().strip(),
+            "user_id": self.user_id.get().strip(),
+            "out": self.out_dir.get().strip(),
+            "hosts": self._refresh_hosts(steps),
+            "options": self._plan_options(),
+        }
+
+    def _poll_ui_calls(self) -> None:
+        if not self.winfo_exists():
             return
-        self.status.set("Waiting for the network…")
-        threading.Thread(target=self._wait_for_network, args=(hosts, steps), daemon=True).start()
+        try:
+            while True:
+                fn = self._ui_calls.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
+        self.after(30, self._poll_ui_calls)
+
+    def _call_on_ui(self, fn):
+        """Run fn on the window thread and wait until it has finished."""
+        if threading.current_thread() is self._ui_thread:
+            return fn()
+        done = threading.Event()
+        box: dict = {}
+
+        def wrapper() -> None:
+            try:
+                if not self.winfo_exists():
+                    box["closed"] = True
+                else:
+                    box["result"] = fn()
+            except BaseException as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        self._ui_calls.put(wrapper)
+        if not done.wait(120):
+            raise TimeoutError("The window did not finish the refresh step.")
+        if box.get("closed"):
+            return None
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    def _hosts_ready(self, hosts: list[str]) -> bool:
+        for _attempt in range(12):
+            open_window = self._call_on_ui(self.winfo_exists)
+            if not open_window:
+                return False
+            if all(host_resolves(host, 3) for host in hosts):
+                return True
+            time.sleep(5)
+        return False
+
+    def _auto_pipeline(self, snapshot: dict) -> None:
+        """Run one refresh. Playlists finish, then Emby, then the .strm folder."""
+        steps: list[str] = list(snapshot["steps"])
+        note = ""
+        playlists_ok = "playlists" not in steps
+        emby_ok = "emby" not in steps
+        try:
+            hosts = snapshot["hosts"]
+            if hosts and not self._hosts_ready(hosts):
+                self._call_on_ui(lambda: self.status.set("Network is not ready. Trying the refresh anyway…"))
+            if "playlists" in steps:
+                loaded, failures, total = self._fetch_auto_playlists(snapshot["files"], snapshot["urls"])
+                if not loaded:
+                    playlists_ok = False
+                    note = " ".join(failures) or "No playlists could be loaded."
+                    self._call_on_ui(lambda note=note: self._set_error(note))
+                else:
+                    playlists_ok = True
+                    if failures:
+                        note = f"Loaded {len(loaded)} of {total}. " + " ".join(failures)
+
+                    def apply_sources(loaded=loaded, note=note) -> None:
+                        self.sources = loaded
+                        self._refresh_sources()
+                        self._auto_note = note
+                        self._set_error(note)
+
+                    self._call_on_ui(apply_sources)
+                    self._call_on_ui(lambda: self.status.set("Playlists updated."))
+            if "emby" in steps and self._call_on_ui(self.winfo_exists):
+                self._call_on_ui(lambda: self.status.set("Updating Emby library…"))
+                if not snapshot["emby"] or not snapshot["api_key"]:
+                    emby_ok = False
+                    message = "Enter the Emby server address and API key before automatic library updates."
+                    self._call_on_ui(lambda message=message: self._set_error(message))
+                else:
+                    try:
+                        items = self.cleaner.fetch_emby(snapshot["emby"], snapshot["api_key"], snapshot["user_id"])
+                    except BaseException as exc:
+                        emby_ok = False
+                        message = explain(exc)
+                        self._call_on_ui(lambda message=message: self._set_error(message))
+                    else:
+                        if not items:
+                            emby_ok = False
+                            message = "Emby returned no movies, shows, or episodes."
+                            self._call_on_ui(lambda message=message: self._set_error(message))
+                        else:
+                            emby_ok = True
+
+                            def apply_emby(items=items, note=note) -> None:
+                                self.library = items
+                                suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
+                                self.library_label = f"Emby · {len(items):,} items{suffix}"
+                                self._show_library()
+                                self._auto_note = note
+                                self._set_error(note)
+                                self._save_settings()
+                                self.status.set("Emby library updated.")
+
+                            self._call_on_ui(apply_emby)
+            if not self._call_on_ui(self.winfo_exists):
+                return
+            if playlists_ok and emby_ok and "apply" in steps:
+                self._call_on_ui(lambda: self.status.set("Updating .strm files…"))
+            if playlists_ok and emby_ok:
+                planned = self._plan_snapshot(snapshot["options"])
+                self._call_on_ui(lambda planned=planned: self._show_planned(planned))
+            else:
+                planned = None
+            if "apply" not in steps or planned is None:
+                return
+            if not planned:
+                self._call_on_ui(
+                    lambda: self._set_error("No playlist is loaded, so the .strm folder was not changed.")
+                )
+                return
+            folder = self._folder_from_text(snapshot["out"])
+            if folder is None:
+                self._call_on_ui(
+                    lambda: self._set_error("Choose the folder where the .strm files should be written.")
+                )
+                return
+            removed = self._removal_count(folder, planned)
+            kept = sum(1 for row in planned if row["disposition"] == "keep")
+            folder.mkdir(parents=True, exist_ok=True)
+            self.cleaner.write_plan(folder, planned, True)
+
+            def finish_write(kept=kept, removed=removed, folder=folder, note=note) -> None:
+                extra = f" Removed {removed:,} files that were already in the folder." if removed else ""
+                self._auto_note = note
+                self._set_error(note)
+                self.status.set(f"Wrote {kept:,} .strm files to {folder}.{extra}")
+                self._save_settings()
+
+            self._call_on_ui(finish_write)
+        except BaseException as exc:
+            message = explain(exc)
+            try:
+                self._call_on_ui(lambda message=message: self._set_error(message))
+            except Exception:
+                pass
+        finally:
+            def finish() -> None:
+                current = self.status.get()
+                if current.startswith("Updating") or current.startswith("Waiting") or current.startswith("Network"):
+                    self.status.set("Ready")
+                self._busy = False
+                self._set_busy(False)
+                self._auto_queue = []
+                self._auto_running = False
+                self._schedule_refresh()
+
+            try:
+                self._call_on_ui(finish)
+            except Exception:
+                self._busy = False
+                self._auto_queue = []
+                self._auto_running = False
+
+    def _fetch_auto_playlists(self, files: list[str], urls: list[str]) -> tuple[list[dict], list[str], int]:
+        loaded: list[dict] = []
+        failures: list[str] = []
+        total = len(files) + len(urls)
+        if total == 0:
+            return loaded, ["Add a playlist link or playlist file before automatic loading."], 0
+        number = 0
+        for path in files:
+            number += 1
+            current = number
+            self._call_on_ui(lambda current=current, total=total: self.status.set(f"Updating playlist {current} of {total}…"))
+            try:
+                loaded.append(self._read_source(path, "file"))
+            except BaseException as exc:
+                failures.append(f"{Path(path).name}: {explain(exc)}")
+        for url in urls:
+            number += 1
+            current = number
+            self._call_on_ui(lambda current=current, total=total: self.status.set(f"Updating playlist {current} of {total}…"))
+            try:
+                loaded.append(self._read_source(url, "url"))
+            except BaseException as exc:
+                failures.append(f"{playlist_label(url)}: {explain(exc)}")
+        return loaded, failures, total
+
+    def _plan_snapshot(self, options: dict) -> list[dict]:
+        copied = self._call_on_ui(
+            lambda: (
+                [dict(source, entries=list(source["entries"])) for source in self.sources],
+                None if self.library is None else list(self.library),
+            )
+        )
+        if not copied:
+            return []
+        sources, library = copied
+        entries = [entry for source in sources for entry in source["entries"]]
+        if not entries:
+            return []
+        planned = self.cleaner.plan_entries(entries, library, options)
+        for entry, row in zip(entries, planned):
+            row["group"] = entry.get("group") or ""
+        return planned
+
+    def _show_planned(self, planned: list[dict]) -> None:
+        self.planned = planned
+        self.fill_tree()
+
+    def _folder_from_text(self, raw: str) -> Path | None:
+        text = raw.strip()
+        if not text:
+            return None
+        path = Path(text)
+        if not path.is_absolute():
+            path = app_dir() / path
+        return path
 
     def _refresh_hosts(self, steps: list[str]) -> list[str]:
         hosts: list[str] = []
@@ -1211,50 +1469,6 @@ class App(tk.Tk):
             if host and host not in hosts:
                 hosts.append(host)
         return hosts
-
-    def _wait_for_network(self, hosts: list[str], steps: list[str]) -> None:
-        ready = False
-        for _attempt in range(12):
-            if not self.winfo_exists():
-                return
-            if all(host_resolves(host, 3) for host in hosts):
-                ready = True
-                break
-            time.sleep(5)
-
-        def start() -> None:
-            if not self.winfo_exists() or self._busy or self._auto_queue:
-                return
-            if not ready:
-                self.status.set("Network is not ready. Trying the refresh anyway…")
-            self._start_auto_steps(steps)
-
-        self.after(0, start)
-
-    def _start_auto_steps(self, steps: list[str]) -> None:
-        self._auto_note = ""
-        self._auto_queue = list(steps)
-        self._run_auto_next()
-
-    def _run_auto_next(self) -> None:
-        if self._busy:
-            return
-        if not self._auto_queue:
-            self._schedule_refresh()
-            return
-        step = self._auto_queue.pop(0)
-        if step == "playlists":
-            self._auto_load_playlists()
-        elif step == "emby":
-            self._auto_pull_emby()
-        elif step == "apply":
-            self._auto_apply()
-
-    def _skip_auto_apply(self) -> None:
-        self._auto_queue = [step for step in self._auto_queue if step != "apply"]
-
-    def _continue_auto(self) -> None:
-        self.after(0, self._run_auto_next)
 
     def _schedule_refresh(self) -> None:
         if self._refresh_job is not None:
@@ -1277,7 +1491,7 @@ class App(tk.Tk):
         self._refresh_job = None
         if not self.winfo_exists():
             return
-        if self._busy or self._auto_queue:
+        if self._busy or self._auto_running or self._auto_queue:
             self._refresh_job = self.after(60_000, self._refresh_tick)
             return
         self._startup_auto()
@@ -1302,7 +1516,7 @@ class App(tk.Tk):
             button.state(state)
 
     def _run(self, label: str, work, done) -> None:
-        if self._busy:
+        if self._busy or self._auto_running:
             return
         self._busy = True
         self._set_busy(True)
@@ -1325,7 +1539,8 @@ class App(tk.Tk):
         self._set_busy(False)
         self._set_error(message)
         self.status.set("Ready")
-        self._after_auto_step()
+        if not self._auto_running:
+            self._schedule_refresh()
 
     def _finish_ok(self, done, result) -> None:
         try:
@@ -1479,121 +1694,6 @@ class App(tk.Tk):
             self.status.set(f"Loaded {len(loaded)} playlist link{'s' if len(loaded) != 1 else ''}.")
 
         self._run("Loading playlists…", work, done)
-
-    def _auto_load_playlists(self) -> None:
-        urls = [link for link in self.links if link.strip()]
-        files = list(self.playlist_files)
-        if not urls and not files:
-            self._set_error("Add a playlist link or playlist file before automatic loading.")
-            self.status.set("Ready")
-            self._skip_auto_apply()
-            self._run_auto_next()
-            return
-
-        def work():
-            loaded_files = []
-            loaded_urls = []
-            failures = []
-            for path in files:
-                try:
-                    loaded_files.append(self._read_source(path, "file"))
-                except BaseException as exc:
-                    failures.append(f"{Path(path).name}: {explain(exc)}")
-            for index, url in enumerate(urls, start=1):
-                self.after(0, lambda index=index, total=len(urls): self.status.set(f"Loading playlist {index} of {total}…"))
-                try:
-                    loaded_urls.append(self._read_source(url, "url"))
-                except BaseException as exc:
-                    failures.append(f"{playlist_label(url)}: {explain(exc)}")
-            return loaded_files, loaded_urls, failures
-
-        def done(result) -> None:
-            loaded_files, loaded_urls, failures = result
-            loaded = loaded_files + loaded_urls
-            total = len(files) + len(urls)
-            if not loaded:
-                self._set_error(" ".join(failures) or "No playlists could be loaded.")
-                self.status.set("Ready")
-                self._skip_auto_apply()
-                self._continue_auto()
-                return
-            self.sources = loaded
-            self._refresh_sources()
-            self.build_plan()
-            if failures:
-                self._auto_note = f"Loaded {len(loaded)} of {total}. " + " ".join(failures)
-                self._set_error(self._auto_note)
-            else:
-                self._auto_note = ""
-                self._set_error("")
-            self.status.set(f"Loaded {len(loaded)} playlist{'s' if len(loaded) != 1 else ''}.")
-            self._continue_auto()
-
-        self._run("Loading playlists…", work, done)
-
-    def _auto_pull_emby(self) -> None:
-        base = self.emby.get().strip()
-        key = self.api_key.get().strip()
-        user = self.user_id.get().strip()
-        if not base or not key:
-            self._set_error("Enter the Emby server address and API key before automatic library updates.")
-            self.status.set("Ready")
-            self._skip_auto_apply()
-            self._run_auto_next()
-            return
-
-        def work():
-            return self.cleaner.fetch_emby(base, key, user)
-
-        def done(items) -> None:
-            if not items:
-                self._set_error("Emby returned no movies, shows, or episodes.")
-                self.status.set("Ready")
-                self._skip_auto_apply()
-                self._continue_auto()
-                return
-            self.library = items
-            suffix = " (stopped at 30,000)" if len(items) >= 30000 else ""
-            self.library_label = f"Emby · {len(items):,} items{suffix}"
-            self._show_library()
-            self.build_plan()
-            self._save_settings()
-            self._set_error(self._auto_note)
-            self.status.set(self.library_label)
-            self._continue_auto()
-
-        self._run("Reading Emby library…", work, done)
-
-    def _auto_apply(self) -> None:
-        if self.auto_pull_emby.get() and self.library is None:
-            self._set_error("The Emby library was not loaded, so the .strm folder was not changed.")
-            self.status.set("Ready")
-            self._after_auto_step()
-            return
-        if not self.planned:
-            self._set_error("No playlist is loaded, so the .strm folder was not changed.")
-            self.status.set("Ready")
-            self._after_auto_step()
-            return
-        try:
-            folder = self._out_path()
-            if folder is None:
-                self.status.set("Ready")
-                self._after_auto_step()
-                return
-            removed = self._removal_count(folder)
-        except BaseException as exc:
-            self._set_error(explain(exc))
-            self.status.set("Ready")
-            self._after_auto_step()
-            return
-        self._start_write(folder, removed, then_auto=True)
-
-    def _after_auto_step(self) -> None:
-        if self._auto_queue:
-            self._continue_auto()
-        else:
-            self._schedule_refresh()
 
     def remove_source(self) -> None:
         selected = list(self.source_list.curselection())
@@ -1805,11 +1905,12 @@ class App(tk.Tk):
             return " · ".join(source["label"] for source in self.sources)
         return f"{len(self.sources)} playlists"
 
-    def _removal_count(self, folder: Path) -> int:
+    def _removal_count(self, folder: Path, planned: list[dict] | None = None) -> int:
+        rows = self.planned if planned is None else planned
         if not self.cleaner.directory_reachable(folder):
             return 0
         removed = 0
-        for row in self.planned:
+        for row in rows:
             if row["disposition"] == "keep":
                 continue
             target = self.cleaner.inside(folder, row["path"])
@@ -1847,9 +1948,9 @@ class App(tk.Tk):
             message += f"\n\n{warning}"
         if not messagebox.askyesno("Write .strm files", message, parent=self):
             return
-        self._start_write(folder, removed, then_auto=False)
+        self._start_write(folder, removed)
 
-    def _start_write(self, folder: Path, removed: int, *, then_auto: bool) -> None:
+    def _start_write(self, folder: Path, removed: int) -> None:
         planned = self.planned
         kept = sum(1 for row in self.planned if row["disposition"] == "keep")
 
@@ -1867,8 +1968,6 @@ class App(tk.Tk):
                 self._set_error("")
             self.status.set(f"Wrote {written:,} .strm files to {folder}.{extra}")
             self._save_settings()
-            if then_auto:
-                self._continue_auto()
 
         self._run("Writing .strm files…", work, done)
 
@@ -1982,6 +2081,9 @@ class App(tk.Tk):
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
             self._refresh_job = None
+        if self._startup_job is not None:
+            self.after_cancel(self._startup_job)
+            self._startup_job = None
         pending = self.link_entry.get().strip()
         if pending:
             self.add_link()
@@ -2124,6 +2226,70 @@ def self_check() -> None:
         assert app.planned[0]["path"] == "The Matrix.strm", app.planned[0]["path"]
         assert "left out" in app.summary.get()
         assert app.tree.item(children[0], "values")[2] in {"New", "Leave out"}
+        order: list[str] = []
+        active = {"name": ""}
+        problems: list[str] = []
+
+        def fetch_text(url: str) -> str:
+            if active["name"]:
+                problems.append(f"playlist overlapped {active['name']}")
+            active["name"] = "playlist"
+            order.append("playlist")
+            time.sleep(0.06)
+            active["name"] = ""
+            return SAMPLE_PLAYLIST
+
+        def fetch_emby(_base: str, _key: str, _user: str) -> list[dict]:
+            if active["name"]:
+                problems.append(f"emby overlapped {active['name']}")
+            if order != ["playlist", "playlist"]:
+                problems.append(f"emby started early: {order}")
+            active["name"] = "emby"
+            order.append("emby")
+            time.sleep(0.06)
+            active["name"] = ""
+            return [{"name": "The Matrix", "year": 1999, "type": "Movie"}]
+
+        def write_plan(_out: Path, _planned: list[dict], _apply: bool) -> None:
+            if active["name"]:
+                problems.append(f"write overlapped {active['name']}")
+            if order != ["playlist", "playlist", "emby"]:
+                problems.append(f"write started early: {order}")
+            order.append("write")
+
+        app.cleaner.fetch_text = fetch_text
+        app.cleaner.fetch_emby = fetch_emby
+        app.cleaner.write_plan = write_plan
+        sequence_dir = tempfile.mkdtemp(prefix="nimbovod-seq-")
+        try:
+            app.links = ["http://127.0.0.1/one.m3u", "http://127.0.0.1/two.m3u"]
+            app.playlist_files = []
+            app.emby.set("http://127.0.0.1:8096")
+            app.api_key.set("test-key")
+            app.user_id.set("")
+            app.out_dir.set(sequence_dir)
+            if app._tag_job is not None:
+                app.after_cancel(app._tag_job)
+                app._tag_job = None
+            snapshot = app._auto_snapshot(["playlists", "emby", "apply"])
+            app._auto_running = True
+            app._busy = True
+            worker = threading.Thread(target=lambda: app._auto_pipeline(snapshot), daemon=True)
+            worker.start()
+            deadline = time.time() + 15
+            while time.time() < deadline and worker.is_alive():
+                app.update()
+                time.sleep(0.02)
+            worker.join(2)
+            assert order == ["playlist", "playlist", "emby", "write"], (order, problems, app.status.get())
+            assert not problems, problems
+            assert not app._auto_running
+            assert not app._busy
+            assert app.status.get().startswith("Wrote"), app.status.get()
+        finally:
+            import shutil
+
+            shutil.rmtree(sequence_dir, ignore_errors=True)
     finally:
         if app is not None:
             app.destroy()
