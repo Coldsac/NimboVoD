@@ -3,6 +3,7 @@
 
 Build a .strm folder from an M3U playlist, compare it with an Emby library,
 and delete only the .strm files from this playlist that Emby already has.
+An existing .strm file is rewritten only when its address differs from the plan.
 
 Nothing is written or deleted unless you pass --apply.
 A home-network Emby address is fine here; this runs on your machine.
@@ -591,39 +592,88 @@ def inside(root: Path, relative: str) -> Path:
     return target
 
 
-def write_plan(out: Path, planned: list[dict], apply: bool) -> None:
-    removed = 0
-    written = 0
+def strm_text(path: Path) -> str | None:
+    """Stripped text of an existing .strm file. None when that file is absent."""
+    try:
+        if not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            raw = handle.read(8192)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace").strip()
+
+
+def write_plan(out: Path, planned: list[dict], apply: bool, on_progress=None) -> dict[str, int]:
+    """Add missing .strm files, replace changed addresses, and delete planned drops.
+
+    A file whose text already matches the planned URL is left untouched. A path
+    that a keep row writes is never deleted. Files that are not in the plan are
+    not scanned and not removed. apply=False counts the same actions and writes
+    nothing. on_progress, when set, is called as on_progress(done, total).
+    """
+    counts = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0}
     kept_paths = {row["path"].replace("\\", "/").lower() for row in planned if row["disposition"] == "keep"}
-    for row in planned:
+    total = len(planned)
+    reported = 0.0
+
+    def report(done: int) -> None:
+        nonlocal reported
+        if on_progress is None or total == 0:
+            return
+        now = time.time()
+        if done != total and now - reported < 0.25:
+            return
+        reported = now
+        on_progress(done, total)
+
+    for index, row in enumerate(planned, start=1):
         if row["disposition"] != "keep" and row["path"].replace("\\", "/").lower() in kept_paths:
+            report(index)
             continue
         target = inside(out, row["path"])
         if row["disposition"] == "keep":
-            if apply:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(row["url"].strip() + "\n", encoding="utf-8")
-            written += 1
-            continue
-        if target.exists() and target.is_file():
+            wanted = str(row.get("url", "")).strip()
+            current = strm_text(target)
+            if current is None:
+                counts["added"] += 1
+                if apply:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(wanted + "\n", encoding="utf-8", newline="\n")
+            elif current == wanted:
+                counts["unchanged"] += 1
+            else:
+                counts["updated"] += 1
+                if apply:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(wanted + "\n", encoding="utf-8", newline="\n")
+        elif target.is_file():
+            counts["removed"] += 1
             if apply:
                 target.unlink()
-            removed += 1
             print(f"{'deleted' if apply else 'would delete'}  {row['path']}  ({row['reason']})")
+        report(index)
     kept = sum(1 for row in planned if row["disposition"] == "keep")
     dropped = len(planned) - kept
     print("")
     print(f"Playlist entries: {len(planned)}")
     print(f"Already in Emby or duplicate: {dropped}")
-    print(f"New .strm files: {kept}")
-    print(f"Existing duplicate files {'removed' if apply else 'that would be removed'}: {removed}")
+    print(f".strm files to keep: {kept}")
+    print(f"Already matching: {counts['unchanged']}")
+    print(f"New .strm files: {counts['added']}")
+    print(f"Replaced because the address changed: {counts['updated']}")
+    print(f"Existing duplicate files {'removed' if apply else 'that would be removed'}: {counts['removed']}")
     if not apply:
         if os.environ.get("NIMBOVOD_HOME"):
             print("Dry run only. Nothing was written. When the plan looks right, run: nimbovod-cleaner.exe --apply")
         else:
             print("Dry run only. Pass --apply to write the new files and remove duplicates already in the folder.")
     else:
-        print(f"Wrote {written} files under {out}")
+        print(
+            f"Added {counts['added']}, updated {counts['updated']}, "
+            f"left {counts['unchanged']} unchanged, removed {counts['removed']} under {out}"
+        )
+    return counts
 
 
 def load_config(path: str | None) -> dict:
@@ -782,6 +832,43 @@ def self_test() -> None:
         assert directory_reachable(folder)
         assert not directory_reachable(folder / "missing")
         assert name_resolves("localhost", 2)
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        matching = b"https://example.com/a\r\n"
+        old_b = b"https://example.com/b-old\n"
+        other = b"leave me\n"
+        (folder / "A.strm").write_bytes(matching)
+        (folder / "B.strm").write_bytes(old_b)
+        (folder / "C.strm").write_bytes(b"https://example.com/c\n")
+        (folder / "Other.strm").write_bytes(other)
+        rows = [
+            {"path": "A.strm", "url": "https://example.com/a", "disposition": "keep", "reason": ""},
+            {"path": "B.strm", "url": "https://example.com/b-new", "disposition": "keep", "reason": ""},
+            {"path": "New.strm", "url": "https://example.com/new", "disposition": "keep", "reason": ""},
+            {"path": "Shows/Pilot.strm", "url": "https://example.com/pilot", "disposition": "keep", "reason": ""},
+            {"path": "C.strm", "url": "https://example.com/c", "disposition": "drop", "reason": "Already in Emby"},
+            {"path": "A.strm", "url": "https://example.com/a-old", "disposition": "drop", "reason": "Duplicate .strm file"},
+        ]
+        before = {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()}
+        seen: list[tuple[int, int]] = []
+        preview = write_plan(folder, rows, False, lambda done, total: seen.append((done, total)))
+        assert preview == {"added": 2, "updated": 1, "unchanged": 1, "removed": 1}, preview
+        assert seen[-1] == (len(rows), len(rows))
+        after_preview = {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()}
+        assert after_preview == before
+        assert not (folder / "Shows").exists()
+        applied = write_plan(folder, rows, True)
+        assert applied == {"added": 2, "updated": 1, "unchanged": 1, "removed": 1}, applied
+        assert (folder / "A.strm").read_bytes() == matching
+        assert (folder / "B.strm").read_text(encoding="utf-8").strip() == "https://example.com/b-new"
+        assert (folder / "New.strm").read_text(encoding="utf-8").strip() == "https://example.com/new"
+        assert (folder / "Shows" / "Pilot.strm").read_text(encoding="utf-8").strip() == "https://example.com/pilot"
+        assert not (folder / "C.strm").exists()
+        assert (folder / "Other.strm").read_bytes() == other
+        again = write_plan(folder, rows, True)
+        assert again == {"added": 0, "updated": 0, "unchanged": 4, "removed": 0}, again
+        assert (folder / "A.strm").read_bytes() == matching
+        assert (folder / "Other.strm").read_bytes() == other
     print("self-test ok")
 
 

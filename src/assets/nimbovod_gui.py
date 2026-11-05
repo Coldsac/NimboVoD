@@ -824,7 +824,8 @@ class App(tk.Tk):
                 "Checked steps run when NimboVoD opens, one at a time: playlists finish, then the Emby library, "
                 "then the .strm folder. A number of minutes runs that same sequence again. Leave it blank to refresh "
                 "only when the program opens. Playlists are the saved links and local playlist files. Emby uses the "
-                "saved address and API key. The folder then gains new .strm files and loses ones the plan leaves out. "
+                "saved address and API key. The folder then adds new .strm files, replaces a file when its address "
+                "changed, and removes files the plan leaves out. Files that already match stay as they are. "
                 "Other files in the folder are left alone. Updating the folder does not ask again."
             ),
             style="CardMuted.TLabel",
@@ -948,7 +949,7 @@ class App(tk.Tk):
         self._button(write_row, "Save report", self.save_report).pack(side="left", padx=(8, 0))
         ttk.Label(
             save,
-            text="Write .strm files asks before it changes the folder. With automatic updates on, opening NimboVoD writes new files and removes ones the plan leaves out without asking again. View plan shows what will be kept and left out.",
+            text="Write .strm files asks before it changes the folder. Matching files stay, new streams are added, and changed addresses are replaced. With automatic updates on, opening NimboVoD applies that same update without asking again. View plan shows what will be kept and left out.",
             style="CardMuted.TLabel",
             wraplength=400,
         ).pack(anchor="w", pady=(8, 0))
@@ -1364,16 +1365,14 @@ class App(tk.Tk):
                     lambda: self._set_error("Choose the folder where the .strm files should be written.")
                 )
                 return
-            removed = self._removal_count(folder, planned)
             kept = sum(1 for row in planned if row["disposition"] == "keep")
             folder.mkdir(parents=True, exist_ok=True)
-            self.cleaner.write_plan(folder, planned, True)
+            counts = self.cleaner.write_plan(folder, planned, True, self._strm_progress)
 
-            def finish_write(kept=kept, removed=removed, folder=folder, note=note) -> None:
-                extra = f" Removed {removed:,} files that were already in the folder." if removed else ""
+            def finish_write(counts=counts, kept=kept, folder=folder, note=note) -> None:
                 self._auto_note = note
                 self._set_error(note)
-                self.status.set(f"Wrote {kept:,} .strm files to {folder}.{extra}")
+                self.status.set(self._write_status(folder, counts, kept))
                 self._save_settings()
 
             self._call_on_ui(finish_write)
@@ -1979,14 +1978,50 @@ class App(tk.Tk):
         rows = self.planned if planned is None else planned
         if not self.cleaner.directory_reachable(folder):
             return 0
+        kept_paths = {
+            row["path"].replace("\\", "/").lower() for row in rows if row["disposition"] == "keep"
+        }
         removed = 0
+        seen: set[str] = set()
         for row in rows:
             if row["disposition"] == "keep":
                 continue
+            key = row["path"].replace("\\", "/").lower()
+            if key in kept_paths or key in seen:
+                continue
+            seen.add(key)
             target = self.cleaner.inside(folder, row["path"])
             if target.is_file():
                 removed += 1
         return removed
+
+    def _write_status(self, folder: Path, counts: object, fallback_kept: int) -> str:
+        if not isinstance(counts, dict):
+            return f"Wrote {fallback_kept:,} .strm files to {folder}."
+        added = int(counts.get("added") or 0)
+        updated = int(counts.get("updated") or 0)
+        unchanged = int(counts.get("unchanged") or 0)
+        removed = int(counts.get("removed") or 0)
+        if added == 0 and updated == 0 and removed == 0:
+            return f".strm folder already matches. Left {unchanged:,} files unchanged in {folder}."
+        parts: list[str] = []
+        if added:
+            parts.append(f"added {added:,}")
+        if updated:
+            parts.append(f"updated {updated:,}")
+        if unchanged:
+            parts.append(f"left {unchanged:,} unchanged")
+        if parts:
+            summary = ", ".join(parts)
+            summary = summary[0].upper() + summary[1:] + f" in {folder}."
+        else:
+            summary = f"Updated {folder}."
+        if removed:
+            summary += f" Removed {removed:,} files that were already in the folder."
+        return summary
+
+    def _strm_progress(self, done: int, total: int) -> None:
+        self._post_status(f"Checking .strm files… {done:,} of {total:,}")
 
     def write_files(self) -> None:
         if self._busy:
@@ -2002,15 +2037,18 @@ class App(tk.Tk):
         except BaseException as exc:
             self._set_error(explain(exc))
             return
-        kept = sum(1 for row in self.planned if row["disposition"] == "keep")
-        message = f"Write {kept:,} .strm files to\n{folder}?"
+        message = (
+            f"Update the .strm files in\n{folder}?\n\n"
+            "Files that already match the playlist stay as they are. "
+            "New streams are added, and files whose address changed are replaced."
+        )
         if removed:
             message += (
-                f"\n\n{removed:,} existing files in that folder will be deleted because they are already in Emby "
+                f"\n\n{removed:,} existing files will be removed because they are already in Emby "
                 "or are duplicate streams."
             )
         else:
-            message += "\n\nNo existing files in that folder will be deleted."
+            message += "\n\nNo planned files will be removed."
         if self.library is None:
             warning = "No Emby library is loaded, so every stream is treated as new."
             if self.emby.get().strip() or self.api_key.get().strip():
@@ -2018,25 +2056,22 @@ class App(tk.Tk):
             message += f"\n\n{warning}"
         if not messagebox.askyesno("Write .strm files", message, parent=self):
             return
-        self._start_write(folder, removed)
+        self._start_write(folder)
 
-    def _start_write(self, folder: Path, removed: int) -> None:
+    def _start_write(self, folder: Path) -> None:
         planned = self.planned
         kept = sum(1 for row in self.planned if row["disposition"] == "keep")
 
         def work():
             folder.mkdir(parents=True, exist_ok=True)
-            self.cleaner.write_plan(folder, planned, True)
-            return kept, removed
+            return self.cleaner.write_plan(folder, planned, True, self._strm_progress)
 
         def done(result) -> None:
-            written, deleted = result
-            extra = f" Removed {deleted:,} files that were already in the folder." if deleted else ""
             if self._auto_note:
                 self._set_error(self._auto_note)
             else:
                 self._set_error("")
-            self.status.set(f"Wrote {written:,} .strm files to {folder}.{extra}")
+            self.status.set(self._write_status(folder, result, kept))
             self._save_settings()
 
         self._run("Writing .strm files…", work, done)
@@ -2320,12 +2355,13 @@ def self_check() -> None:
             active["name"] = ""
             return [{"name": "The Matrix", "year": 1999, "type": "Movie"}]
 
-        def write_plan(_out: Path, _planned: list[dict], _apply: bool) -> None:
+        def write_plan(_out: Path, _planned: list[dict], _apply: bool, on_progress=None) -> dict[str, int]:
             if active["name"]:
                 problems.append(f"write overlapped {active['name']}")
             if order != ["playlist", "playlist", "emby"]:
                 problems.append(f"write started early: {order}")
             order.append("write")
+            return {"added": 1, "updated": 0, "unchanged": 2, "removed": 0}
 
         app.cleaner.fetch_text = fetch_text
         app.cleaner.fetch_emby = fetch_emby
@@ -2355,7 +2391,8 @@ def self_check() -> None:
             assert not problems, problems
             assert not app._auto_running
             assert not app._busy
-            assert app.status.get().startswith("Wrote"), app.status.get()
+            assert app.status.get().startswith("Added 1"), app.status.get()
+            assert "left 2 unchanged" in app.status.get()
         finally:
             import shutil
 
