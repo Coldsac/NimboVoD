@@ -222,6 +222,20 @@ def auto_steps(pull_playlists: bool, pull_emby: bool, apply_strm: bool) -> list[
     return steps
 
 
+def refresh_minutes(value: str) -> int:
+    """Minutes between automatic refreshes. Blank or invalid means off."""
+    text = value.strip()
+    if not text:
+        return 0
+    try:
+        minutes = int(text)
+    except ValueError:
+        return 0
+    if minutes < 1:
+        return 0
+    return min(minutes, 10080)
+
+
 def load_cleaner():
     path = cleaner_path()
     if not path.is_file():
@@ -399,6 +413,7 @@ class App(tk.Tk):
         self._tag_job: str | None = None
         self._wheel_job: str | None = None
         self._wheel_pending = 0.0
+        self._refresh_job: str | None = None
         self.links: list[str] = []
         self.playlist_files: list[str] = []
         self.sources: list[dict] = []
@@ -441,6 +456,7 @@ class App(tk.Tk):
         self.auto_pull_playlists = tk.IntVar(value=0)
         self.auto_pull_emby = tk.IntVar(value=0)
         self.auto_apply_strm = tk.IntVar(value=0)
+        self.refresh_minutes = tk.StringVar(value="")
         self.show_key = tk.IntVar(value=0)
         self.filter_mode = tk.StringVar(value="All")
         self.query = tk.StringVar()
@@ -759,12 +775,19 @@ class App(tk.Tk):
             variable=self.auto_apply_strm,
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(4, 0))
+        timer = ttk.Frame(settings, style="Card.TFrame")
+        timer.pack(fill="x", pady=(10, 0))
+        ttk.Label(timer, text="Refresh every", style="Card.TLabel").pack(side="left")
+        refresh_entry = ttk.Entry(timer, textvariable=self.refresh_minutes, width=6)
+        refresh_entry.pack(side="left", padx=(8, 6))
+        ttk.Label(timer, text="minutes", style="Card.TLabel").pack(side="left")
         ttk.Label(
             settings,
             text=(
-                "Checked steps run when NimboVoD opens. Playlists are the saved links and local playlist files. "
-                "Emby uses the saved address and API key. The folder then gains new .strm files and loses ones the "
-                "plan leaves out. Other files in the folder are left alone. Updating the folder does not ask again."
+                "Checked steps run when NimboVoD opens. A number of minutes runs them again on a timer. "
+                "Leave it blank to refresh only when the program opens. Playlists are the saved links and local "
+                "playlist files. Emby uses the saved address and API key. The folder then gains new .strm files and "
+                "loses ones the plan leaves out. Other files in the folder are left alone. Updating the folder does not ask again."
             ),
             style="CardMuted.TLabel",
             wraplength=400,
@@ -1063,6 +1086,7 @@ class App(tk.Tk):
         self.run_at_startup.trace_add("write", self._on_startup_toggle)
         for variable in (self.auto_pull_playlists, self.auto_pull_emby, self.auto_apply_strm):
             variable.trace_add("write", self._on_auto_option)
+        self.refresh_minutes.trace_add("write", self._on_refresh_minutes)
         self.out_dir.trace_add("write", self._schedule_tags)
         self.extra_tags.bind("<KeyRelease>", self._schedule_tags)
         self.extra_tags.bind("<<Paste>>", self._schedule_tags)
@@ -1094,6 +1118,13 @@ class App(tk.Tk):
         if not self._ready:
             return
         self._save_settings()
+        self._schedule_refresh()
+
+    def _on_refresh_minutes(self, *_args: object) -> None:
+        if not self._ready:
+            return
+        self._save_settings()
+        self._schedule_refresh()
 
     def _on_startup_toggle(self, *_args: object) -> None:
         if not self._ready:
@@ -1122,7 +1153,10 @@ class App(tk.Tk):
         self._run_auto_next()
 
     def _run_auto_next(self) -> None:
-        if not self._auto_queue or self._busy:
+        if self._busy:
+            return
+        if not self._auto_queue:
+            self._schedule_refresh()
             return
         step = self._auto_queue.pop(0)
         if step == "playlists":
@@ -1137,6 +1171,32 @@ class App(tk.Tk):
 
     def _continue_auto(self) -> None:
         self.after(0, self._run_auto_next)
+
+    def _schedule_refresh(self) -> None:
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+            self._refresh_job = None
+        if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
+            return
+        minutes = refresh_minutes(self.refresh_minutes.get())
+        if minutes < 1:
+            return
+        if not (
+            self.auto_pull_playlists.get()
+            or self.auto_pull_emby.get()
+            or self.auto_apply_strm.get()
+        ):
+            return
+        self._refresh_job = self.after(minutes * 60 * 1000, self._refresh_tick)
+
+    def _refresh_tick(self) -> None:
+        self._refresh_job = None
+        if not self.winfo_exists():
+            return
+        if self._busy or self._auto_queue:
+            self._refresh_job = self.after(60_000, self._refresh_tick)
+            return
+        self._startup_auto()
 
     def _update_layout_hint(self) -> None:
         self.layout_hint.set(LAYOUT_HINTS.get(self.layout.get(), LAYOUT_HINTS["group"]))
@@ -1750,6 +1810,7 @@ class App(tk.Tk):
             "autoPullPlaylists": bool(self.auto_pull_playlists.get()),
             "autoPullEmby": bool(self.auto_pull_emby.get()),
             "autoApplyStrm": bool(self.auto_apply_strm.get()),
+            "refreshMinutes": refresh_minutes(self.refresh_minutes.get()),
             "geometry": self.geometry(),
         }
 
@@ -1796,6 +1857,9 @@ class App(tk.Tk):
         ):
             if isinstance(saved.get(key), bool):
                 variable.set(1 if saved[key] else 0)
+        minutes = saved.get("refreshMinutes")
+        if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0:
+            self.refresh_minutes.set(str(min(minutes, 10080)))
         files = saved.get("playlistFiles")
         if isinstance(files, list):
             self.playlist_files = []
@@ -1817,6 +1881,9 @@ class App(tk.Tk):
         if self._wheel_job is not None:
             self.after_cancel(self._wheel_job)
             self._wheel_job = None
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+            self._refresh_job = None
         pending = self.link_entry.get().strip()
         if pending:
             self.add_link()
@@ -1870,6 +1937,11 @@ def self_check() -> None:
     assert auto_steps(True, True, True) == ["playlists", "emby", "apply"]
     assert auto_steps(False, False, False) == []
     assert auto_steps(False, True, True) == ["emby", "apply"]
+    assert refresh_minutes("") == 0
+    assert refresh_minutes("0") == 0
+    assert refresh_minutes("15") == 15
+    assert refresh_minutes("abc") == 0
+    assert refresh_minutes("999999") == 10080
     handle = tempfile.NamedTemporaryFile(prefix="nimbovod-settings-", suffix=".json", delete=False)
     handle.close()
     os.environ["NIMBOVOD_SETTINGS"] = handle.name
@@ -1880,6 +1952,7 @@ def self_check() -> None:
                 "autoPullPlaylists": True,
                 "autoPullEmby": True,
                 "autoApplyStrm": True,
+                "refreshMinutes": 45,
                 "playlistFiles": [r"C:\playlists\test.m3u"],
             }
         ),
@@ -1908,6 +1981,12 @@ def self_check() -> None:
         assert collected["autoPullPlaylists"] is True
         assert collected["autoPullEmby"] is True
         assert collected["autoApplyStrm"] is True
+        assert collected["refreshMinutes"] == 45
+        assert app.refresh_minutes.get() == "45"
+        assert app._refresh_job is None
+        app.refresh_minutes.set("10")
+        assert app._refresh_job is None
+        app.refresh_minutes.set("45")
         assert collected["playlistFiles"] == [r"C:\playlists\test.m3u"]
         wheel = type("Wheel", (), {"delta": -120})()
         app._wheel_form(wheel)

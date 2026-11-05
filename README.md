@@ -15,7 +15,7 @@ The program is not stored in git. Settings, including the API key, are saved in 
 - **Automatically pull the Emby library** reads Emby with the saved address and API key.
 - **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out.
 
-These automatic steps are off until you turn them on. They run when the program opens. Updating the folder does not ask again.
+These automatic steps are off until you turn them on. They run when the program opens. **Refresh every** runs the checked steps again after that many minutes. Leave it blank to refresh only when NimboVoD opens. Updating the folder does not ask again.
 
 **Playlists**
 
