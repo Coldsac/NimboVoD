@@ -447,6 +447,8 @@ class App(tk.Tk):
         self.sources: list[dict] = []
         self.library: list[dict] | None = None
         self.library_label = ""
+        self.emby_libraries: list[dict] = []
+        self._library_vars: list[tk.IntVar] = []
         self.planned: list[dict] = []
         self._buttons: list[ttk.Button] = []
         self._busy = False
@@ -920,6 +922,19 @@ class App(tk.Tk):
         self.api_entry = ttk.Entry(emby, textvariable=self.api_key, show="•")
         self.api_entry.pack(fill="x", pady=(4, 6))
         self._labeled_entry(emby, "User id", self.user_id, "Optional. Leave blank to read the whole server.")
+        library_head = ttk.Frame(emby, style="Card.TFrame")
+        library_head.pack(fill="x", pady=(8, 4))
+        ttk.Label(library_head, text="Libraries", style="Card.TLabel").pack(side="left")
+        self._button(library_head, "Load libraries", self.load_emby_libraries).pack(side="right")
+        self.library_choice = ttk.Frame(emby, style="Card.TFrame")
+        self.library_choice.pack(fill="x")
+        ttk.Label(
+            emby,
+            text="Load libraries, then uncheck any that should be left out of the comparison. Until you load them, the pull reads every library.",
+            style="CardMuted.TLabel",
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 6))
+        self._render_library_choices()
         emby_actions = ttk.Frame(emby, style="Card.TFrame")
         emby_actions.pack(fill="x", pady=(2, 6))
         self._button(emby_actions, "Pull library", self.pull_emby, accent=True).pack(side="left")
@@ -1229,6 +1244,7 @@ class App(tk.Tk):
             "emby": self.emby.get().strip(),
             "api_key": self.api_key.get().strip(),
             "user_id": self.user_id.get().strip(),
+            "libraries": self._libraries_for_fetch(),
             "out": self.out_dir.get().strip(),
             "hosts": self._refresh_hosts(steps),
             "options": self._plan_options(),
@@ -1317,10 +1333,18 @@ class App(tk.Tk):
                     emby_ok = False
                     message = "Enter the Emby server address and API key before automatic library updates."
                     self._call_on_ui(lambda message=message: self._set_error(message))
+                elif snapshot.get("libraries") == []:
+                    emby_ok = False
+                    message = "Select at least one Emby library."
+                    self._call_on_ui(lambda message=message: self._set_error(message))
                 else:
                     try:
                         items = self.cleaner.fetch_emby(
-                            snapshot["emby"], snapshot["api_key"], snapshot["user_id"], self._emby_progress
+                            snapshot["emby"],
+                            snapshot["api_key"],
+                            snapshot["user_id"],
+                            self._emby_progress,
+                            snapshot.get("libraries"),
                         )
                     except BaseException as exc:
                         emby_ok = False
@@ -1338,6 +1362,11 @@ class App(tk.Tk):
                                 self.library = items
                                 suffix = self._library_limit_suffix(len(items))
                                 self.library_label = f"Emby · {len(items):,} items{suffix}"
+                                chosen = snapshot.get("libraries") or []
+                                if chosen:
+                                    self.library_label += " · " + ", ".join(
+                                        item["name"] for item in chosen if item.get("name")
+                                    )
                                 self._show_library()
                                 self._auto_note = note
                                 self._set_error(note)
@@ -1585,11 +1614,100 @@ class App(tk.Tk):
             return f" (stopped at {self.cleaner.ITEM_LIMIT:,})"
         return ""
 
-    def _emby_progress(self, done: int, total: int | None) -> None:
+    def _emby_progress(self, done: int, total: int | None, label: str | None = None) -> None:
+        prefix = f"{label} · " if label else ""
         if total:
-            self._post_status(f"Reading Emby library… {done:,} of {total:,}")
+            self._post_status(f"Reading Emby library… {prefix}{done:,} of {total:,}")
         else:
-            self._post_status(f"Reading Emby library… {done:,}")
+            self._post_status(f"Reading Emby library… {prefix}{done:,}")
+
+    def _library_choice_text(self, item: dict) -> str:
+        name = str(item.get("name") or "")
+        kind = str(item.get("type") or "")
+        same_name = sum(1 for other in self.emby_libraries if other.get("name") == name)
+        if kind and same_name > 1:
+            return f"{name} ({kind})"
+        return name
+
+    def _render_library_choices(self) -> None:
+        frame = self.library_choice
+        for child in frame.winfo_children():
+            child.destroy()
+        self._library_vars = []
+        if not self.emby_libraries:
+            note = ttk.Label(
+                frame,
+                text="Every library is used until you load the list.",
+                style="CardMuted.TLabel",
+                wraplength=400,
+            )
+            note.pack(anchor="w")
+            note.bind("<MouseWheel>", self._wheel_form)
+            return
+        for item in self.emby_libraries:
+            var = tk.IntVar(value=1 if item.get("selected") else 0)
+            self._library_vars.append(var)
+            check = ttk.Checkbutton(
+                frame,
+                text=self._library_choice_text(item),
+                variable=var,
+                command=self._store_library_checks,
+                style="Card.TCheckbutton",
+            )
+            check.pack(anchor="w")
+            check.bind("<MouseWheel>", self._wheel_form)
+
+    def _store_library_checks(self) -> None:
+        for item, var in zip(self.emby_libraries, self._library_vars):
+            item["selected"] = bool(var.get())
+        self._save_settings()
+
+    def _libraries_for_fetch(self) -> list[dict] | None:
+        if not self.emby_libraries:
+            return None
+        chosen = [
+            {"id": item["id"], "name": item["name"]}
+            for item in self.emby_libraries
+            if item.get("selected") and item.get("id")
+        ]
+        return chosen
+
+    def load_emby_libraries(self) -> None:
+        base = self.emby.get().strip()
+        key = self.api_key.get().strip()
+        if not base or not key:
+            self._set_error("Enter the Emby server address and API key.")
+            return
+        previous = {item["id"]: item for item in self.emby_libraries if item.get("id")}
+
+        def work():
+            return self.cleaner.list_emby_libraries(base, key)
+
+        def done(rows) -> None:
+            merged = []
+            for row in rows:
+                old = previous.get(row["id"])
+                if not previous:
+                    selected = True
+                elif old is not None:
+                    selected = bool(old.get("selected"))
+                else:
+                    selected = False
+                merged.append(
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "type": row.get("type") or "",
+                        "selected": selected,
+                    }
+                )
+            self.emby_libraries = merged
+            self._render_library_choices()
+            self._set_error("")
+            self.status.set(f"Found {len(merged)} Emby libraries.")
+            self._save_settings()
+
+        self._run("Loading Emby libraries…", work, done)
 
     def _show_library(self) -> None:
         if self.library is None:
@@ -1798,9 +1916,13 @@ class App(tk.Tk):
         if not base or not key:
             self._set_error("Enter the Emby server address and API key.")
             return
+        libraries = self._libraries_for_fetch()
+        if libraries == []:
+            self._set_error("Select at least one Emby library.")
+            return
 
         def work():
-            return self.cleaner.fetch_emby(base, key, user, self._emby_progress)
+            return self.cleaner.fetch_emby(base, key, user, self._emby_progress, libraries)
 
         def done(items) -> None:
             if not items:
@@ -1810,6 +1932,8 @@ class App(tk.Tk):
             self.library = items
             suffix = self._library_limit_suffix(len(items))
             self.library_label = f"Emby · {len(items):,} items{suffix}"
+            if libraries:
+                self.library_label += " · " + ", ".join(item["name"] for item in libraries)
             self._show_library()
             self.build_plan()
             self._set_error("")
@@ -2126,6 +2250,16 @@ class App(tk.Tk):
             "autoPullEmby": bool(self.auto_pull_emby.get()),
             "autoApplyStrm": bool(self.auto_apply_strm.get()),
             "refreshMinutes": refresh_minutes(self.refresh_minutes.get()),
+            "embyLibraries": [
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "type": item.get("type") or "",
+                    "selected": bool(item.get("selected")),
+                }
+                for item in self.emby_libraries
+                if item.get("id") and item.get("name")
+            ],
             "geometry": self.geometry(),
         }
 
@@ -2181,6 +2315,29 @@ class App(tk.Tk):
             for item in files:
                 if isinstance(item, str) and item.strip():
                     self._remember_playlist_file(item.strip())
+        saved_libraries = saved.get("embyLibraries")
+        if isinstance(saved_libraries, list):
+            parsed_libraries = []
+            for item in saved_libraries:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id")
+                name = item.get("name")
+                if not isinstance(item_id, str) or not item_id.strip():
+                    continue
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                kind = item.get("type")
+                parsed_libraries.append(
+                    {
+                        "id": item_id.strip(),
+                        "name": name.strip(),
+                        "type": kind if isinstance(kind, str) else "",
+                        "selected": item.get("selected") is True,
+                    }
+                )
+            self.emby_libraries = parsed_libraries
+        self._render_library_choices()
         extra_tags = saved.get("extraTags")
         if isinstance(extra_tags, str) and extra_tags.strip():
             self.extra_tags.insert("1.0", extra_tags.strip())
@@ -2308,6 +2465,15 @@ def self_check() -> None:
         assert app._refresh_job is None
         app.refresh_minutes.set("45")
         assert collected["playlistFiles"] == [r"C:\playlists\test.m3u"]
+        app.emby_libraries = [
+            {"id": "tv", "name": "TV shows", "type": "tvshows", "selected": True},
+            {"id": "vod", "name": "TV VoD", "type": "tvshows", "selected": True},
+        ]
+        app._render_library_choices()
+        app._library_vars[1].set(0)
+        app._store_library_checks()
+        assert app._collect_settings()["embyLibraries"][1]["selected"] is False
+        assert app._libraries_for_fetch() == [{"id": "tv", "name": "TV shows"}]
         wheel = type("Wheel", (), {"delta": -120})()
         app._wheel_form(wheel)
         app._wheel_form(wheel)
@@ -2358,7 +2524,7 @@ def self_check() -> None:
             active["name"] = ""
             return SAMPLE_PLAYLIST
 
-        def fetch_emby(_base: str, _key: str, _user: str, on_progress=None) -> list[dict]:
+        def fetch_emby(_base: str, _key: str, _user: str, on_progress=None, libraries=None) -> list[dict]:
             if active["name"]:
                 problems.append(f"emby overlapped {active['name']}")
             if order != ["playlist", "playlist"]:

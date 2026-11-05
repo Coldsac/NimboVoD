@@ -553,31 +553,102 @@ def directory_reachable(path: Path, timeout: float = 2.0) -> bool:
     return bool(outcome.get("ok"))
 
 
-def request_json(url: str, api_key: str) -> dict:
+def read_json(url: str, api_key: str):
     request = urllib.request.Request(
         url,
         headers={"X-Emby-Token": api_key, "Accept": "application/json"},
     )
     payload = json.loads(read_response(request).decode("utf-8"))
+    if not isinstance(payload, (dict, list)):
+        raise SystemExit("Emby did not return a library list.")
+    return payload
+
+
+def request_json(url: str, api_key: str) -> dict:
+    payload = read_json(url, api_key)
     if not isinstance(payload, dict):
         raise SystemExit("Emby did not return a library list.")
     return payload
 
 
-def fetch_emby(base_url: str, api_key: str, user_id: str, on_progress=None) -> list[dict]:
+def emby_origin(base_url: str) -> str:
     origin = base_url.rstrip("/")
     origin = re.sub(r"/web(/index\.html?)?$", "", origin, flags=re.I)
     origin = re.sub(r"/emby$", "", origin, flags=re.I)
-    user_path = f"/Users/{urllib.parse.quote(user_id)}/Items" if user_id else "/Items"
+    return origin
+
+
+def library_rows(payload: object) -> list[dict]:
+    raw_items: list = []
+    if isinstance(payload, dict):
+        items = payload.get("Items")
+        if isinstance(items, list):
+            raw_items = items
+    elif isinstance(payload, list):
+        raw_items = payload
+    found: list[dict] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "").strip()
+        item_id = str(item.get("Id") or item.get("ItemId") or "").strip()
+        if not name or not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        kind = item.get("CollectionType")
+        found.append({"id": item_id, "name": name, "type": kind if isinstance(kind, str) else ""})
+    found.sort(key=lambda row: row["name"].lower())
+    return found
+
+
+def list_emby_libraries(base_url: str, api_key: str) -> list[dict]:
+    origin = emby_origin(base_url)
     last_error = "Emby could not be reached."
     for prefix in ("/emby", ""):
         try:
-            start = 0
+            payload = read_json(f"{origin}{prefix}/Library/MediaFolders", api_key)
+            rows = library_rows(payload)
+            if rows:
+                return rows
+            last_error = "Emby did not return any libraries."
+        except urllib.error.HTTPError as error:
+            if error.code in {401, 403}:
+                raise SystemExit("Emby refused that API key.") from error
+            last_error = f"Emby responded with {error.code}."
+        except RuntimeError as error:
+            last_error = str(error)
+        except urllib.error.URLError as error:
+            raise SystemExit(f"Could not reach Emby: {error.reason}") from error
+    raise SystemExit(last_error)
+
+
+def fetch_emby(
+    base_url: str,
+    api_key: str,
+    user_id: str,
+    on_progress=None,
+    libraries: list[dict] | None = None,
+) -> list[dict]:
+    origin = emby_origin(base_url)
+    user_path = f"/Users/{urllib.parse.quote(user_id)}/Items" if user_id else "/Items"
+    chosen: list[dict] = []
+    for item in libraries or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        chosen.append({"id": item_id, "name": str(item.get("name") or item_id).strip()})
+    targets = chosen or [{"id": "", "name": ""}]
+    last_error = "Emby could not be reached."
+    for prefix in ("/emby", ""):
+        try:
             items: list[dict] = []
-            total = None
+            seen: set[str] = set()
             reported = 0.0
 
-            def report(done: int, total_count: int | None, force: bool = False) -> None:
+            def report(done: int, total_count: int | None, label: str, force: bool = False) -> None:
                 nonlocal reported
                 if on_progress is None:
                     return
@@ -585,11 +656,16 @@ def fetch_emby(base_url: str, api_key: str, user_id: str, on_progress=None) -> l
                 if not force and now - reported < 0.25:
                     return
                 reported = now
-                on_progress(done, total_count)
+                on_progress(done, total_count, label or None)
 
-            while len(items) < ITEM_LIMIT:
-                query = urllib.parse.urlencode(
-                    {
+            for target in targets:
+                if len(items) >= ITEM_LIMIT:
+                    break
+                start = 0
+                total = None
+                fetched = 0
+                while len(items) < ITEM_LIMIT:
+                    params = {
                         "Recursive": "true",
                         "IncludeItemTypes": "Movie,Series,Episode",
                         "Fields": "Path,ProductionYear",
@@ -598,33 +674,45 @@ def fetch_emby(base_url: str, api_key: str, user_id: str, on_progress=None) -> l
                         "EnableImages": "false",
                         "EnableUserData": "false",
                     }
-                )
-                payload = request_json(f"{origin}{prefix}{user_path}?{query}", api_key)
-                batch = payload.get("Items")
-                if not isinstance(batch, list):
-                    raise RuntimeError("Emby did not return a library list.")
-                for raw in batch:
-                    if not isinstance(raw, dict) or not raw.get("Name"):
-                        continue
-                    kind = raw.get("Type") if raw.get("Type") in {"Movie", "Series", "Episode"} else "Other"
-                    items.append(
-                        {
-                            "name": raw.get("Name"),
-                            "year": raw.get("ProductionYear"),
-                            "type": kind,
-                            "path": raw.get("Path"),
-                            "seriesName": raw.get("SeriesName"),
-                            "season": raw.get("ParentIndexNumber"),
-                            "episode": raw.get("IndexNumber"),
-                        }
+                    if target["id"]:
+                        params["ParentId"] = target["id"]
+                    query = urllib.parse.urlencode(params)
+                    payload = request_json(f"{origin}{prefix}{user_path}?{query}", api_key)
+                    batch = payload.get("Items")
+                    if not isinstance(batch, list):
+                        raise RuntimeError("Emby did not return a library list.")
+                    for raw in batch:
+                        if not isinstance(raw, dict) or not raw.get("Name"):
+                            continue
+                        item_id = raw.get("Id")
+                        if isinstance(item_id, str) and item_id:
+                            if item_id in seen:
+                                continue
+                            seen.add(item_id)
+                        kind = raw.get("Type") if raw.get("Type") in {"Movie", "Series", "Episode"} else "Other"
+                        items.append(
+                            {
+                                "name": raw.get("Name"),
+                                "year": raw.get("ProductionYear"),
+                                "type": kind,
+                                "path": raw.get("Path"),
+                                "seriesName": raw.get("SeriesName"),
+                                "season": raw.get("ParentIndexNumber"),
+                                "episode": raw.get("IndexNumber"),
+                            }
+                        )
+                        fetched += 1
+                    start += len(batch)
+                    if isinstance(payload.get("TotalRecordCount"), int):
+                        total = payload["TotalRecordCount"]
+                    finished = (
+                        len(batch) < PAGE_SIZE
+                        or (total is not None and start >= total)
+                        or len(items) >= ITEM_LIMIT
                     )
-                start += len(batch)
-                if isinstance(payload.get("TotalRecordCount"), int):
-                    total = payload["TotalRecordCount"]
-                finished = len(batch) < PAGE_SIZE or (total is not None and start >= total) or len(items) >= ITEM_LIMIT
-                report(len(items), total, force=finished)
-                if finished:
-                    break
+                    report(fetched if target["id"] else len(items), total, target["name"], force=finished)
+                    if finished:
+                        break
             return items
         except urllib.error.HTTPError as error:
             if error.code in {401, 403}:
@@ -986,6 +1074,20 @@ def self_test() -> None:
         assert again == {"added": 0, "updated": 0, "unchanged": 4, "removed": 0}, again
         assert (folder / "A.strm").read_bytes() == matching
         assert (folder / "Other.strm").read_bytes() == other
+    listed = library_rows(
+        {
+            "Items": [
+                {"Name": "TV shows", "Id": "1", "CollectionType": "tvshows"},
+                {"Name": "TV shows", "Id": "1", "CollectionType": "tvshows"},
+                {"Name": "", "Id": "2"},
+                {"Name": "Movies", "ItemId": "3", "CollectionType": "movies"},
+            ]
+        }
+    )
+    assert listed == [
+        {"id": "3", "name": "Movies", "type": "movies"},
+        {"id": "1", "name": "TV shows", "type": "tvshows"},
+    ], listed
     print("self-test ok")
 
 
