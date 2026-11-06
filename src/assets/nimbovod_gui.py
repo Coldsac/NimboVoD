@@ -39,6 +39,8 @@ ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
 MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
 TREE_LIMIT = 2500
+APP_VERSION = "1.11"
+RELEASES_URL = "https://api.github.com/repos/Coldsac/NimboVoD/releases?per_page=30"
 
 LAYOUT_HINTS = {
     "group": "One folder per group-title. The same stream URL in two playlists is kept once.",
@@ -461,6 +463,10 @@ def apply_startup_registration(enabled: bool) -> str | None:
     return None
 
 
+# The first automatic update waits so a sign-in launch can find the network and the save folder.
+STARTUP_UPDATE_DELAY_MS = 60_000
+
+
 def auto_steps(pull_playlists: bool, pull_emby: bool, apply_strm: bool) -> list[str]:
     steps: list[str] = []
     if pull_playlists:
@@ -528,6 +534,56 @@ def explain(exc: BaseException) -> str:
         return str(exc.code)
     message = str(exc).strip()
     return message or exc.__class__.__name__
+
+
+def version_key(tag: str) -> tuple[int, ...] | None:
+    """Turn v1.10 into (1, 10). Tags that are not version numbers are ignored."""
+    text = tag.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    if not text:
+        return None
+    numbers: list[int] = []
+    for part in text.split("."):
+        if not part.isdigit():
+            return None
+        numbers.append(int(part))
+    return tuple(numbers)
+
+
+def release_notes(payload: object) -> list[dict]:
+    """Published versioned releases, newest first."""
+    if not isinstance(payload, list):
+        raise SystemExit("GitHub did not return a release list.")
+    notes = []
+    for item in payload:
+        if not isinstance(item, dict) or item.get("draft") or item.get("prerelease"):
+            continue
+        tag = item.get("tag_name")
+        if not isinstance(tag, str) or version_key(tag) is None:
+            continue
+        body = item.get("body") if isinstance(item.get("body"), str) else ""
+        name = item.get("name") if isinstance(item.get("name"), str) else ""
+        url = item.get("html_url") if isinstance(item.get("html_url"), str) else ""
+        published = item.get("published_at") if isinstance(item.get("published_at"), str) else ""
+        notes.append(
+            {
+                "tag": tag,
+                "name": name.strip() or tag,
+                "body": body.strip(),
+                "url": url,
+                "date": published[:10],
+            }
+        )
+    notes.sort(key=lambda note: version_key(note["tag"]) or (), reverse=True)
+    return notes
+
+
+def newer_releases(notes: list[dict], current: str) -> list[dict]:
+    current_key = version_key(current)
+    if current_key is None:
+        return list(notes)
+    return [note for note in notes if (version_key(note["tag"]) or ()) > current_key]
 
 
 def playlist_label(source: str) -> str:
@@ -710,6 +766,8 @@ class App(tk.Tk):
         self._tray_icon = None
         self._tray_icon_owned = False
         self._plan_hidden_for_tray = False
+        self._updates_hidden_for_tray = False
+        self._update_checking = False
         self._tray_hook_tries = 0
         self._tray_minimizing = False
         self._tray_requests: list[str] = []
@@ -717,6 +775,7 @@ class App(tk.Tk):
         self.geometry("640x720")
         self.minsize(560, 640)
         self.plan_window: tk.Toplevel | None = None
+        self.updates_window: tk.Toplevel | None = None
         self.configure(bg=CANVAS)
         self._init_vars()
         self._apply_style()
@@ -1095,16 +1154,22 @@ class App(tk.Tk):
             pending["busy"] = True
             try:
                 width = canvas.winfo_width()
-                if width > 1:
-                    canvas.itemconfigure(window, width=width)
-                bbox = canvas.bbox("all")
-                if not bbox:
+                view = canvas.winfo_height()
+                if width <= 1 or view <= 1:
                     return
-                canvas.configure(scrollregion=bbox)
-                overflow = (bbox[3] - bbox[1]) - canvas.winfo_height()
-                if overflow > 2 and not bar.winfo_ismapped():
+                # reqheight stays the form's own height. The extra page below that
+                # is filled in, so the wheel cannot travel through blank space.
+                natural = inner.winfo_reqheight()
+                span = natural if natural > view + 2 else view
+                current_width = int(float(canvas.itemcget(window, "width") or 0))
+                current_height = int(float(canvas.itemcget(window, "height") or 0))
+                if current_width != width or current_height != span:
+                    canvas.itemconfigure(window, width=width, height=span)
+                canvas.configure(scrollregion=(0, 0, width, span))
+                shown = bar.winfo_manager() == "pack"
+                if natural > view + 2 and not shown:
                     bar.pack(side="right", fill="y")
-                elif overflow <= 2 and bar.winfo_ismapped():
+                elif natural <= view + 2 and shown:
                     bar.pack_forget()
                     canvas.yview_moveto(0)
             finally:
@@ -1114,7 +1179,7 @@ class App(tk.Tk):
         canvas.bind("<Configure>", schedule)
         canvas.bind("<MouseWheel>", self._wheel_form)
         self._tab_canvases.append(canvas)
-        return self._panel(inner, expand=False)
+        return self._panel(inner, expand=True)
 
     def _bind_tab_wheel(self, widget: tk.Misc) -> None:
         if widget not in (getattr(self, "link_list", None), getattr(self, "source_list", None), getattr(self, "paste", None), getattr(self, "extra_tags", None)):
@@ -1166,10 +1231,20 @@ class App(tk.Tk):
         ttk.Label(timer, text="minutes", style="Card.TLabel").pack(side="left")
         self._hint(
             page,
-            "Checked steps run when NimboVoD opens, one at a time: playlists, then Emby, then the .strm folder. "
-            "A number of minutes repeats that sequence. Leave it blank to run only when the program opens. "
+            "Checked steps wait one minute after NimboVoD opens, then run one at a time: playlists, then Emby, then the .strm folder. "
+            "A number of minutes repeats that sequence. Leave it blank to run only that first update. "
             "Updating the folder does not ask again.",
             pady=(8, 0),
+        )
+        updates = ttk.Frame(page, style="Card.TFrame")
+        updates.pack(fill="x", pady=(14, 0))
+        ttk.Label(updates, text=f"Version {APP_VERSION}", style="Card.TLabel").pack(side="left")
+        self.update_button = self._button(updates, "Check for updates", self.check_updates)
+        self.update_button.pack(side="right")
+        self._hint(
+            page,
+            "Looks at the GitHub releases and shows anything newer than this copy.",
+            pady=(4, 0),
         )
 
     def _build_playlist_tab(self, page: ttk.Frame) -> None:
@@ -1413,6 +1488,139 @@ class App(tk.Tk):
         if hasattr(self, "tree"):
             del self.tree
 
+    def check_updates(self) -> None:
+        if self._update_checking:
+            return
+        self._update_checking = True
+        self._update_status = self.status.get() in ("", "Ready")
+        self.update_button.configure(state="disabled")
+        self._set_error("")
+        if self._update_status:
+            self.status.set("Checking for updates…")
+
+        def work() -> None:
+            try:
+                request = urllib.request.Request(
+                    RELEASES_URL,
+                    headers={
+                        "User-Agent": f"NimboVoD/{APP_VERSION}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                )
+                raw = self.cleaner.read_response(request, timeout=20, limit_seconds=30, max_bytes=2_000_000)
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    raise SystemExit("GitHub did not return a release list.")
+                notes = release_notes(payload)
+                newer = newer_releases(notes, APP_VERSION)
+            except BaseException as exc:
+                message = explain(exc)
+                self._call_on_ui(lambda message=message: self._finish_update_check(error=message))
+                return
+            self._call_on_ui(lambda notes=notes, newer=newer: self._show_updates(notes, newer))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_update_check(self, notes: list[dict] | None = None, newer: list[dict] | None = None, error: str = "") -> None:
+        self._update_checking = False
+        if self.update_button.winfo_exists():
+            self.update_button.configure(state="normal")
+        if self._update_status and self.status.get() == "Checking for updates…":
+            self.status.set("Ready")
+        if error:
+            self._set_error(error)
+            return
+        self._show_updates(notes or [], newer or [])
+
+    def _show_updates(self, notes: list[dict], newer: list[dict]) -> None:
+        self._finish_update_check_chrome()
+        self._set_error("")
+        if self.updates_window is not None and self.updates_window.winfo_exists():
+            self.updates_window.destroy()
+        window = tk.Toplevel(self)
+        self.updates_window = window
+        window.title("NimboVoD updates")
+        window.configure(bg=CANVAS)
+        window.geometry("680x520")
+        window.minsize(480, 360)
+        window.transient(self)
+        window.after_idle(lambda window=window: use_dark_titlebar(window))
+        window.protocol("WM_DELETE_WINDOW", self._close_updates)
+        tk.Frame(window, bg=ACCENT, height=2).pack(fill="x")
+        body = tk.Frame(window, bg=CANVAS)
+        body.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(body, text="Updates", bg=CANVAS, fg=FG, font=("Segoe UI", 16)).pack(anchor="w")
+        if newer:
+            count = len(newer)
+            summary = f"This copy is {APP_VERSION}. {count} newer release{' is' if count == 1 else 's are'} on GitHub."
+            shown = newer
+        else:
+            summary = f"This copy is {APP_VERSION}. No newer release is on GitHub."
+            shown = notes[:1]
+        tk.Label(
+            body,
+            text=summary,
+            bg=CANVAS,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            anchor="w",
+            wraplength=620,
+        ).pack(anchor="w", pady=(4, 10))
+        text = tk.Text(
+            body,
+            bg=FIELD,
+            fg=FG,
+            insertbackground=FG,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=LINE,
+            highlightcolor=ACCENT,
+            font=("Segoe UI", 10),
+            wrap="word",
+            padx=8,
+            pady=6,
+            borderwidth=0,
+        )
+        text.pack(fill="both", expand=True)
+        text.bind("<MouseWheel>", self._wheel_widget)
+        blocks = []
+        for note in shown:
+            heading = note["name"] if note["name"] != note["tag"] else note["tag"]
+            if note["date"]:
+                heading = f"{heading} · {note['date']}"
+            blocks.append(heading + (f"\n\n{note['body']}" if note["body"] else ""))
+        text.insert("1.0", "\n\n".join(blocks) if blocks else "No releases were published.")
+        text.configure(state="disabled")
+        target = (shown[0]["url"] if shown else "") or ""
+        if target:
+            actions = tk.Frame(body, bg=CANVAS)
+            actions.pack(fill="x", pady=(12, 0))
+            ttk.Button(
+                actions,
+                text="Open release page",
+                command=lambda url=target: self._open_release(url),
+                style="Accent.TButton",
+            ).pack(side="right")
+
+    def _finish_update_check_chrome(self) -> None:
+        self._update_checking = False
+        if getattr(self, "update_button", None) is not None and self.update_button.winfo_exists():
+            self.update_button.configure(state="normal")
+        if getattr(self, "_update_status", False) and self.status.get() == "Checking for updates…":
+            self.status.set("Ready")
+
+    def _open_release(self, url: str) -> None:
+        import webbrowser
+
+        webbrowser.open(url)
+
+    def _close_updates(self) -> None:
+        if self.updates_window is not None and self.updates_window.winfo_exists():
+            self.updates_window.destroy()
+        self.updates_window = None
+
     def _wheel_form(self, event: tk.Event) -> str:
         # One wheel flick can deliver dozens of events. Apply them together so
         # the form is redrawn once per frame instead of once per event.
@@ -1424,6 +1632,18 @@ class App(tk.Tk):
             self._wheel_job = self.after(16, self._apply_form_wheel)
         return "break"
 
+    def _canvas_overflows(self, canvas: tk.Canvas) -> bool:
+        try:
+            if not canvas.winfo_exists():
+                return False
+            region = canvas.cget("scrollregion")
+            if not region:
+                return False
+            _left, top, _right, bottom = (float(value) for value in region.split())
+            return (bottom - top) > canvas.winfo_height() + 2
+        except (tk.TclError, ValueError):
+            return False
+
     def _apply_form_wheel(self) -> None:
         self._wheel_job = None
         if not self.winfo_exists():
@@ -1433,7 +1653,7 @@ class App(tk.Tk):
             return
         self._wheel_pending -= pixels
         canvas = self._wheel_target if self._wheel_target is not None else self.form_canvas
-        if canvas is not None:
+        if canvas is not None and self._canvas_overflows(canvas):
             try:
                 if canvas.winfo_exists():
                     canvas.yview_scroll(pixels, "units")
@@ -1526,19 +1746,36 @@ class App(tk.Tk):
             self._set_error(message)
 
     def _startup_auto(self) -> None:
+        """Arm the first automatic update. Refresh intervals call _begin_startup_auto directly."""
         if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
             return
-        # Paint the window before refreshing. A restart can launch NimboVoD
-        # before the network is up, and a pull at that moment looks frozen.
         if self._startup_job is not None:
             self.after_cancel(self._startup_job)
-        self._startup_job = self.after(1200, self._begin_startup_auto)
+            self._startup_job = None
+        if not self.winfo_exists():
+            return
+        steps = auto_steps(
+            bool(self.auto_pull_playlists.get()),
+            bool(self.auto_pull_emby.get()),
+            bool(self.auto_apply_strm.get()),
+        )
+        if not steps:
+            self._schedule_refresh()
+            return
+        if self._busy or self._auto_running or self._auto_queue:
+            self._startup_job = self.after(STARTUP_UPDATE_DELAY_MS, self._startup_auto)
+            return
+        self.status.set("Waiting 1 minute before the update…")
+        self._startup_job = self.after(STARTUP_UPDATE_DELAY_MS, self._begin_startup_auto)
 
     def _begin_startup_auto(self) -> None:
         self._startup_job = None
         if os.environ.get("NIMBOVOD_SETTINGS", "").strip():
             return
-        if not self.winfo_exists() or self._busy or self._auto_running or self._auto_queue:
+        if not self.winfo_exists():
+            return
+        if self._busy or self._auto_running or self._auto_queue:
+            self._startup_job = self.after(STARTUP_UPDATE_DELAY_MS, self._begin_startup_auto)
             return
         steps = auto_steps(
             bool(self.auto_pull_playlists.get()),
@@ -1889,7 +2126,7 @@ class App(tk.Tk):
         if self._busy or self._auto_running or self._auto_queue:
             self._refresh_job = self.after(60_000, self._refresh_tick)
             return
-        self._startup_auto()
+        self._begin_startup_auto()
 
     def _update_layout_hint(self) -> None:
         self.layout_hint.set(LAYOUT_HINTS.get(self.layout.get(), LAYOUT_HINTS["group"]))
@@ -2843,26 +3080,27 @@ class App(tk.Tk):
                 except tk.TclError:
                     pass
                 return False
-            self._plan_hidden_for_tray = self._withdraw_plan_if_visible()
+            self._plan_hidden_for_tray = self._withdraw_window_if_visible(self.plan_window)
+            self._updates_hidden_for_tray = self._withdraw_window_if_visible(self.updates_window)
             try:
                 self.withdraw()
             except tk.TclError:
                 self._tray_remove()
                 self._plan_hidden_for_tray = False
+                self._updates_hidden_for_tray = False
                 return False
             self._in_tray = True
             return True
         finally:
             self._tray_minimizing = False
 
-    def _withdraw_plan_if_visible(self) -> bool:
-        plan = self.plan_window
-        if plan is None:
+    def _withdraw_window_if_visible(self, window: tk.Toplevel | None) -> bool:
+        if window is None:
             return False
         try:
-            if not plan.winfo_exists() or not plan.winfo_viewable():
+            if not window.winfo_exists() or not window.winfo_viewable():
                 return False
-            plan.withdraw()
+            window.withdraw()
         except tk.TclError:
             return False
         return True
@@ -2870,7 +3108,9 @@ class App(tk.Tk):
     def _restore_from_tray(self) -> None:
         was_hidden = self._in_tray
         show_plan = self._plan_hidden_for_tray
+        show_updates = self._updates_hidden_for_tray
         self._plan_hidden_for_tray = False
+        self._updates_hidden_for_tray = False
         self._in_tray = False
         self._tray_remove()
         if not was_hidden:
@@ -2888,14 +3128,20 @@ class App(tk.Tk):
                 user32.SetForegroundWindow(self._tray_hwnd)
             except Exception:
                 pass
-        if not show_plan or self.plan_window is None:
-            return
-        try:
-            if self.plan_window.winfo_exists():
-                self.plan_window.deiconify()
-                self.plan_window.lift()
-        except tk.TclError:
-            return
+        if show_plan and self.plan_window is not None:
+            try:
+                if self.plan_window.winfo_exists():
+                    self.plan_window.deiconify()
+                    self.plan_window.lift()
+            except tk.TclError:
+                pass
+        if show_updates and self.updates_window is not None:
+            try:
+                if self.updates_window.winfo_exists():
+                    self.updates_window.deiconify()
+                    self.updates_window.lift()
+            except tk.TclError:
+                return
 
     def _show_tray_menu(self) -> None:
         if not self._in_tray or not self._tray_hwnd:
@@ -3053,6 +3299,43 @@ def self_check() -> None:
         ),
         encoding="utf-8",
     )
+    assert version_key("v1.9") < version_key("v1.10")
+    assert version_key("V1.10") == version_key("1.10")
+    assert version_key("nightly") is None
+    sample_releases = [
+        {
+            "tag_name": "v1.10",
+            "name": "v1.10",
+            "body": "Tabs and tray.",
+            "draft": False,
+            "prerelease": False,
+            "html_url": "https://example.com/1.10",
+            "published_at": "2026-11-06T00:28:01Z",
+        },
+        {
+            "tag_name": "v1.9",
+            "name": "",
+            "body": "Tray.",
+            "draft": False,
+            "prerelease": False,
+            "html_url": "https://example.com/1.9",
+            "published_at": "2026-11-05T23:46:35Z",
+        },
+        {"tag_name": "nightly", "body": "skip", "draft": False, "prerelease": False},
+        {"tag_name": "v1.11", "body": "Hidden.", "draft": True, "prerelease": False},
+    ]
+    parsed_releases = release_notes(sample_releases)
+    assert [item["tag"] for item in parsed_releases] == ["v1.10", "v1.9"]
+    assert parsed_releases[0]["date"] == "2026-11-06"
+    assert parsed_releases[0]["body"] == "Tabs and tray."
+    assert [item["tag"] for item in newer_releases(parsed_releases, "1.9")] == ["v1.10"]
+    assert newer_releases(parsed_releases, APP_VERSION) == []
+    try:
+        release_notes({"message": "nope"})
+    except SystemExit as exc:
+        assert "release list" in str(exc)
+    else:
+        raise AssertionError("a release object must be rejected")
     startup_before = read_startup_command()
     app = None
     try:
@@ -3066,6 +3349,31 @@ def self_check() -> None:
         app._startup_auto()
         assert app._auto_queue == []
         assert not app._busy
+        assert app._startup_job is None
+        saved_settings = os.environ.pop("NIMBOVOD_SETTINGS")
+        real_after = app.after
+        scheduled: list[int] = []
+
+        def fake_after(ms, callback=None, *args):
+            if getattr(callback, "__func__", None) is App._begin_startup_auto:
+                scheduled.append(ms)
+                return "startup-delay"
+            if callback is None:
+                return real_after(ms, *args)
+            return real_after(ms, callback, *args)
+
+        try:
+            app.after = fake_after
+            app._startup_auto()
+            assert scheduled == [STARTUP_UPDATE_DELAY_MS], scheduled
+            assert app.status.get() == "Waiting 1 minute before the update…"
+            assert app._startup_job == "startup-delay"
+            assert not app._busy
+        finally:
+            app.after = real_after
+            app._startup_job = None
+            app.status.set("Ready")
+            os.environ["NIMBOVOD_SETTINGS"] = saved_settings
         assert app.run_at_startup.get() == 1
         assert app.auto_pull_playlists.get() == 1
         assert app.auto_pull_emby.get() == 1
@@ -3120,6 +3428,14 @@ def self_check() -> None:
         app.update()
         app.deiconify()
         app.update()
+        playlist_page = app._tab_canvases[0]
+        assert not app._canvas_overflows(playlist_page), (playlist_page.cget("scrollregion"), playlist_page.winfo_height())
+        held = playlist_page.yview()
+        app._wheel_target = playlist_page
+        app._wheel_pending = 400
+        app._apply_form_wheel()
+        assert playlist_page.yview() == held
+        assert app._wheel_pending == 0
         app._install_tray_hook()
         assert window_class(app._tray_hwnd) == "TkTopLevel", window_class(app._tray_hwnd)
         assert int(app._tray_hwnd) != int(app.winfo_id())

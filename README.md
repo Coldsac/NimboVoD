@@ -98,7 +98,9 @@ The options in that picture are an example. They start off, and **Refresh every*
 - **Automatically pull the Emby library** reads Emby with the saved address and API key.
 - **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out. That step does not ask again.
 
-Checked steps run when the program opens, one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes. Leave it blank to refresh only when NimboVoD opens. One minute is the shortest interval. Seven days is the longest.
+Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest.
+
+**Check for updates** reads the [GitHub releases](https://github.com/Coldsac/NimboVoD/releases) and shows anything newer than this copy. **Open release page** opens that release so you can download it.
 
 ## Settings file
 
