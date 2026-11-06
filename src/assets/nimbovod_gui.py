@@ -711,9 +711,11 @@ class App(tk.Tk):
         self._tray_icon_owned = False
         self._plan_hidden_for_tray = False
         self._tray_hook_tries = 0
+        self._tray_minimizing = False
+        self._tray_requests: list[str] = []
         self.title("NimboVoD")
-        self.geometry("560x800")
-        self.minsize(480, 640)
+        self.geometry("640x720")
+        self.minsize(560, 640)
         self.plan_window: tk.Toplevel | None = None
         self.configure(bg=CANVAS)
         self._init_vars()
@@ -856,6 +858,49 @@ class App(tk.Tk):
         style.map("Treeview", background=[("selected", SELECT)], foreground=[("selected", FG)])
         style.map("Treeview.Heading", background=[("active", RAISED)])
         style.configure(
+            "App.TNotebook",
+            background=CANVAS,
+            borderwidth=0,
+            relief="flat",
+            tabmargins=(2, 6, 2, 0),
+        )
+        style.configure(
+            "App.TNotebook.Tab",
+            background=SURFACE,
+            foreground=MUTED,
+            borderwidth=0,
+            padding=(14, 8),
+            font=("Segoe UI", 10),
+            focuscolor=CANVAS,
+        )
+        style.map(
+            "App.TNotebook.Tab",
+            background=[("selected", RAISED), ("active", "#242b3a")],
+            foreground=[("selected", FG), ("active", FG)],
+            padding=[("selected", (14, 8))],
+        )
+        style.layout(
+            "App.TNotebook.Tab",
+            [
+                (
+                    "Notebook.tab",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            (
+                                "Notebook.padding",
+                                {
+                                    "side": "top",
+                                    "sticky": "nswe",
+                                    "children": [("Notebook.label", {"side": "top", "sticky": ""})],
+                                },
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+        style.configure(
             "TCombobox",
             fieldbackground=FIELD,
             background=RAISED,
@@ -902,7 +947,7 @@ class App(tk.Tk):
         tk.Label(text, text="NimboVoD", bg=CANVAS, fg=FG, font=("Segoe UI", 22)).pack(anchor="w", pady=(2, 0))
         self.header_blurb = tk.Label(
             text,
-            text="Turn one or more M3U playlists into a folder of .strm files, then leave out anything already in your Emby library.",
+            text="Playlists in, .strm files out, with anything already in Emby left out.",
             bg=CANVAS,
             fg=MUTED,
             font=("Segoe UI", 9),
@@ -954,29 +999,38 @@ class App(tk.Tk):
         self.after_idle(self._install_tray_hook)
 
     def _on_resize(self, event: tk.Event) -> None:
-        if event.widget is self:
-            self.error_label.configure(wraplength=max(240, event.width - 90))
-            self.header_blurb.configure(wraplength=max(200, event.width - 230))
+        if event.widget is not self:
+            return
+        self.error_label.configure(wraplength=max(240, event.width - 90))
+        self.header_blurb.configure(wraplength=max(200, event.width - 230))
+        hint_width = max(220, event.width - 72)
+        alive = []
+        for label in self._wrapping:
+            try:
+                if label.winfo_exists():
+                    label.configure(wraplength=hint_width)
+                    alive.append(label)
+            except tk.TclError:
+                continue
+        self._wrapping = alive
 
-    def _card(self, parent: tk.Misc, step: str, title: str) -> ttk.Frame:
+    def _tab(self, notebook: ttk.Notebook, title: str) -> tk.Frame:
+        page = tk.Frame(notebook, bg=CANVAS)
+        notebook.add(page, text=title)
+        return page
+
+    def _panel(self, parent: tk.Misc, *, expand: bool) -> ttk.Frame:
         shell = tk.Frame(parent, bg=LINE, padx=1, pady=1)
-        shell.pack(fill="x", pady=(0, 12))
+        shell.pack(fill="both" if expand else "x", expand=expand)
         frame = ttk.Frame(shell, style="Card.TFrame", padding=(14, 12))
         frame.pack(fill="both", expand=True)
-        head = ttk.Frame(frame, style="Card.TFrame")
-        head.pack(fill="x", pady=(0, 10))
-        if step:
-            tk.Label(
-                head,
-                text=step,
-                bg=RAISED,
-                fg=ACCENT,
-                font=("Segoe UI", 8, "bold"),
-                padx=6,
-                pady=1,
-            ).pack(side="left", padx=(0, 8))
-        ttk.Label(head, text=title, style="CardTitle.TLabel").pack(side="left")
         return frame
+
+    def _hint(self, parent: tk.Misc, text: str, **pack) -> ttk.Label:
+        label = ttk.Label(parent, text=text, style="CardMuted.TLabel", wraplength=480)
+        label.pack(anchor="w", **pack)
+        self._wrapping.append(label)
+        return label
 
     def _button(self, parent: tk.Misc, text: str, command, accent: bool = False) -> ttk.Button:
         button = ttk.Button(parent, text=text, command=command, style="Accent.TButton" if accent else "TButton")
@@ -1003,118 +1057,142 @@ class App(tk.Tk):
         return box
 
     def _build_form(self) -> None:
-        shell = self.form_host
-        canvas = tk.Canvas(shell, bg=CANVAS, highlightthickness=0, borderwidth=0)
-        scroll = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set, yscrollincrement=1)
-        scroll.pack(side="right", fill="y")
+        self._wrapping = []
+        self.form_canvas = None
+        notebook = ttk.Notebook(self.form_host, style="App.TNotebook")
+        notebook.pack(fill="both", expand=True)
+        self.notebook = notebook
+        self._tab_canvases: list[tk.Canvas] = []
+        self._wheel_target = None
+        playlists = self._scroll_tab(self._tab(notebook, "Playlists"))
+        self._build_playlist_tab(playlists)
+        self._bind_tab_wheel(playlists)
+        self._build_names_tab(self._panel(self._tab(notebook, "File names"), expand=True))
+        emby = self._scroll_tab(self._tab(notebook, "Emby"))
+        self._build_emby_tab(emby)
+        self._bind_tab_wheel(emby)
+        self._build_output_tab(self._panel(self._tab(notebook, "Output"), expand=False))
+        self._build_settings_tab(self._panel(self._tab(notebook, "Settings"), expand=False))
+
+    def _scroll_tab(self, page: tk.Frame) -> ttk.Frame:
+        """Scroll this tab only when its own contents are taller than the page."""
+        canvas = tk.Canvas(page, bg=CANVAS, highlightthickness=0, borderwidth=0, yscrollincrement=1)
+        bar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
         canvas.pack(side="left", fill="both", expand=True)
-        inner = ttk.Frame(canvas)
+        inner = tk.Frame(canvas, bg=CANVAS)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        fitted = {"width": 0, "region": None, "job": None, "busy": False}
+        pending = {"job": None, "busy": False}
 
-        def _schedule_fit(_event: tk.Event | None = None) -> None:
-            if fitted["job"] is None:
-                fitted["job"] = canvas.after_idle(_apply_fit)
+        def schedule(_event: tk.Event | None = None) -> None:
+            if pending["job"] is None:
+                pending["job"] = canvas.after_idle(apply)
 
-        def _apply_fit() -> None:
-            fitted["job"] = None
-            if fitted["busy"] or not canvas.winfo_exists():
+        def apply() -> None:
+            pending["job"] = None
+            if pending["busy"] or not canvas.winfo_exists():
                 return
-            width = canvas.winfo_width()
-            if width <= 1:
-                return
-            fitted["busy"] = True
+            pending["busy"] = True
             try:
-                if width != fitted["width"]:
-                    fitted["width"] = width
+                width = canvas.winfo_width()
+                if width > 1:
                     canvas.itemconfigure(window, width=width)
                 bbox = canvas.bbox("all")
-                if bbox and bbox != fitted["region"]:
-                    fitted["region"] = bbox
-                    canvas.configure(scrollregion=bbox)
+                if not bbox:
+                    return
+                canvas.configure(scrollregion=bbox)
+                overflow = (bbox[3] - bbox[1]) - canvas.winfo_height()
+                if overflow > 2 and not bar.winfo_ismapped():
+                    bar.pack(side="right", fill="y")
+                elif overflow <= 2 and bar.winfo_ismapped():
+                    bar.pack_forget()
+                    canvas.yview_moveto(0)
             finally:
-                fitted["busy"] = False
+                pending["busy"] = False
 
-        inner.bind("<Configure>", _schedule_fit)
-        canvas.bind("<Configure>", _schedule_fit)
+        inner.bind("<Configure>", schedule)
+        canvas.bind("<Configure>", schedule)
         canvas.bind("<MouseWheel>", self._wheel_form)
-        self.form_canvas = canvas
-        self.form_inner = inner
+        self._tab_canvases.append(canvas)
+        return self._panel(inner, expand=False)
 
-        settings = self._card(inner, "", "Settings")
+    def _bind_tab_wheel(self, widget: tk.Misc) -> None:
+        if widget not in (getattr(self, "link_list", None), getattr(self, "source_list", None), getattr(self, "paste", None), getattr(self, "extra_tags", None)):
+            widget.bind("<MouseWheel>", self._wheel_form)
+        for child in widget.winfo_children():
+            self._bind_tab_wheel(child)
+
+    def _canvas_for_widget(self, widget: tk.Misc | None) -> tk.Canvas | None:
+        while widget is not None:
+            if widget in self._tab_canvases:
+                return widget
+            widget = getattr(widget, "master", None)
+        return None
+
+    def _build_settings_tab(self, page: ttk.Frame) -> None:
         ttk.Checkbutton(
-            settings,
+            page,
             text="Run NimboVoD when Windows starts",
             variable=self.run_at_startup,
             style="Card.TCheckbutton",
         ).pack(anchor="w")
-        ttk.Label(
-            settings,
-            text="Opens this program when you sign in. It uses your account, so administrator rights are not required.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(2, 8))
+        self._hint(
+            page,
+            "Opens this program when you sign in. It uses your account, so administrator rights are not required.",
+            pady=(2, 8),
+        )
         ttk.Checkbutton(
-            settings,
+            page,
             text="Automatically pull the M3U playlists",
             variable=self.auto_pull_playlists,
             style="Card.TCheckbutton",
         ).pack(anchor="w")
         ttk.Checkbutton(
-            settings,
+            page,
             text="Automatically pull the Emby library",
             variable=self.auto_pull_emby,
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(
-            settings,
+            page,
             text="Automatically update the .strm folder",
             variable=self.auto_apply_strm,
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(4, 0))
-        timer = ttk.Frame(settings, style="Card.TFrame")
-        timer.pack(fill="x", pady=(10, 0))
+        timer = ttk.Frame(page, style="Card.TFrame")
+        timer.pack(fill="x", pady=(12, 0))
         ttk.Label(timer, text="Refresh every", style="Card.TLabel").pack(side="left")
-        refresh_entry = ttk.Entry(timer, textvariable=self.refresh_minutes, width=6)
-        refresh_entry.pack(side="left", padx=(8, 6))
+        ttk.Entry(timer, textvariable=self.refresh_minutes, width=6).pack(side="left", padx=(8, 6))
         ttk.Label(timer, text="minutes", style="Card.TLabel").pack(side="left")
-        ttk.Label(
-            settings,
-            text=(
-                "Checked steps run when NimboVoD opens, one at a time: playlists finish, then the Emby library, "
-                "then the .strm folder. A number of minutes runs that same sequence again. Leave it blank to refresh "
-                "only when the program opens. Playlists are the saved links and local playlist files. Emby uses the "
-                "saved address and API key. The folder then adds new .strm files, replaces a file when its address "
-                "changed, and removes files the plan leaves out. Files that already match stay as they are. "
-                "Other files in the folder are left alone. Updating the folder does not ask again."
-            ),
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(6, 0))
+        self._hint(
+            page,
+            "Checked steps run when NimboVoD opens, one at a time: playlists, then Emby, then the .strm folder. "
+            "A number of minutes repeats that sequence. Leave it blank to run only when the program opens. "
+            "Updating the folder does not ask again.",
+            pady=(8, 0),
+        )
 
-        playlists = self._card(inner, "01", "Playlists")
-        ttk.Label(playlists, text="M3U links", style="Card.TLabel").pack(anchor="w")
-        row = ttk.Frame(playlists, style="Card.TFrame")
+    def _build_playlist_tab(self, page: ttk.Frame) -> None:
+        ttk.Label(page, text="M3U links", style="Card.TLabel").pack(anchor="w")
+        row = ttk.Frame(page, style="Card.TFrame")
         row.pack(fill="x", pady=(4, 6))
         entry = ttk.Entry(row, textvariable=self.link_entry)
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda _event: self.add_link())
         self._button(row, "Add", self.add_link).pack(side="left", padx=(8, 0))
-        self.link_list = self._listbox(playlists, 4)
-        self.link_list.pack(fill="x", pady=(0, 6))
-        actions = ttk.Frame(playlists, style="Card.TFrame")
+        self.link_list = self._listbox(page, 4)
+        self.link_list.pack(fill="both", expand=True, pady=(0, 6))
+        actions = ttk.Frame(page, style="Card.TFrame")
         actions.pack(fill="x")
         self._button(actions, "Remove link", self.remove_link).pack(side="left")
         self._button(actions, "Add playlist files", self.add_files).pack(side="left", padx=(8, 0))
         self._button(actions, "Load playlists", self.load_links, accent=True).pack(side="right")
-        ttk.Label(playlists, text="Loaded", style="Card.TLabel").pack(anchor="w", pady=(10, 4))
-        self.source_list = self._listbox(playlists, 4)
-        self.source_list.pack(fill="x")
-        self._button(playlists, "Remove loaded playlist", self.remove_source).pack(anchor="w", pady=(6, 8))
-
-        ttk.Label(playlists, text="Folder layout", style="Card.TLabel").pack(anchor="w")
-        radios = ttk.Frame(playlists, style="Card.TFrame")
+        ttk.Label(page, text="Loaded", style="Card.TLabel").pack(anchor="w", pady=(12, 4))
+        self.source_list = self._listbox(page, 3)
+        self.source_list.pack(fill="both", expand=True)
+        self._button(page, "Remove loaded playlist", self.remove_source).pack(anchor="w", pady=(6, 10))
+        ttk.Label(page, text="Folder layout", style="Card.TLabel").pack(anchor="w")
+        radios = ttk.Frame(page, style="Card.TFrame")
         radios.pack(fill="x", pady=(4, 4))
         for value, label in (("group", "By group"), ("flat", "Flat"), ("library", "Movies & TV")):
             ttk.Radiobutton(
@@ -1123,52 +1201,44 @@ class App(tk.Tk):
                 value=value,
                 variable=self.layout,
                 style="Card.TRadiobutton",
-            ).pack(side="left", padx=(0, 10))
-        ttk.Label(playlists, textvariable=self.layout_hint, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
+            ).pack(side="left", padx=(0, 12))
+        hint = ttk.Label(page, textvariable=self.layout_hint, style="CardMuted.TLabel", wraplength=480)
+        hint.pack(anchor="w")
+        self._wrapping.append(hint)
+
+    def _build_names_tab(self, page: ttk.Frame) -> None:
         ttk.Checkbutton(
-            playlists,
+            page,
             text="Strip quality tags from file names",
             variable=self.strip_quality,
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(0, 8))
-        ttk.Label(playlists, text="Quality tags already removed", style="Card.TLabel").pack(anchor="w")
-        ttk.Label(
-            playlists,
-            text=", ".join(self.cleaner.QUALITY_TAGS),
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(2, 8))
-        ttk.Label(playlists, text="Also strip these tags", style="Card.TLabel").pack(anchor="w")
-        ttk.Label(
-            playlists,
-            text="One per line or separated by commas. They are removed from file names along with the quality tags, and ignored when matching Emby.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(2, 4))
-        self.extra_tags = self._text(playlists, 4)
-        self.extra_tags.pack(fill="x")
+        ttk.Label(page, text="Quality tags already removed", style="Card.TLabel").pack(anchor="w")
+        self._hint(page, ", ".join(self.cleaner.QUALITY_TAGS), pady=(2, 10))
+        ttk.Label(page, text="Also strip these tags", style="Card.TLabel").pack(anchor="w")
+        self._hint(
+            page,
+            "One per line or separated by commas. They are removed from file names and ignored when matching Emby.",
+            pady=(2, 4),
+        )
+        self.extra_tags = self._text(page, 6)
+        self.extra_tags.pack(fill="both", expand=True)
         ttk.Checkbutton(
-            playlists,
+            page,
             text="Remove duplicate .strm files",
             variable=self.drop_duplicate_strm,
             style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(8, 0))
-        ttk.Label(
-            playlists,
-            text="When two streams clean up to the same file, the first is kept and the rest are left out. Numbered copies already in the folder, such as Name (2).strm, are removed too.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(10, 0))
+        self._hint(
+            page,
+            "When two streams clean up to the same file, the first is kept. Numbered copies already in the folder, such as Name (2).strm, are removed too.",
+            pady=(2, 0),
+        )
 
-        emby = self._card(inner, "02", "Emby library")
-        self._labeled_entry(emby, "Server address", self.emby, "http://192.168.1.20:8096")
-        ttk.Label(
-            emby,
-            text="A 192.168 address works here. This program runs on your computer.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(0, 6))
-        key_row = ttk.Frame(emby, style="Card.TFrame")
+    def _build_emby_tab(self, page: ttk.Frame) -> None:
+        self._labeled_entry(page, "Server address", self.emby, "http://192.168.1.20:8096")
+        self._hint(page, "A 192.168 address works here. This program runs on your computer.", pady=(0, 6))
+        key_row = ttk.Frame(page, style="Card.TFrame")
         key_row.pack(fill="x")
         ttk.Label(key_row, text="API key", style="Card.TLabel").pack(side="left")
         ttk.Checkbutton(
@@ -1178,63 +1248,55 @@ class App(tk.Tk):
             command=self._toggle_key,
             style="Card.TCheckbutton",
         ).pack(side="right")
-        self.api_entry = ttk.Entry(emby, textvariable=self.api_key, show="•")
+        self.api_entry = ttk.Entry(page, textvariable=self.api_key, show="•")
         self.api_entry.pack(fill="x", pady=(4, 6))
-        self._labeled_entry(emby, "User id", self.user_id, "Optional. Leave blank to read the whole server.")
-        library_head = ttk.Frame(emby, style="Card.TFrame")
-        library_head.pack(fill="x", pady=(8, 4))
+        self._labeled_entry(page, "User id", self.user_id, "Optional. Leave blank to read the whole server.")
+        library_head = ttk.Frame(page, style="Card.TFrame")
+        library_head.pack(fill="x", pady=(4, 4))
         ttk.Label(library_head, text="Libraries", style="Card.TLabel").pack(side="left")
         self._button(library_head, "Load libraries", self.load_emby_libraries).pack(side="right")
-        self.library_choice = ttk.Frame(emby, style="Card.TFrame")
+        self.library_choice = ttk.Frame(page, style="Card.TFrame")
         self.library_choice.pack(fill="x")
-        ttk.Label(
-            emby,
-            text="Load libraries, then uncheck any that should be left out of the comparison. Until you load them, the pull reads every library.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(2, 6))
+        self._hint(
+            page,
+            "Load libraries, then uncheck any that should be left out of the comparison. Until you load them, the pull reads every library.",
+            pady=(2, 6),
+        )
         self._render_library_choices()
-        emby_actions = ttk.Frame(emby, style="Card.TFrame")
+        emby_actions = ttk.Frame(page, style="Card.TFrame")
         emby_actions.pack(fill="x", pady=(2, 6))
         self._button(emby_actions, "Pull library", self.pull_emby, accent=True).pack(side="left")
         self._button(emby_actions, "Upload export", self.upload_library).pack(side="left", padx=(8, 0))
         self._button(emby_actions, "Clear library", self.clear_library).pack(side="left", padx=(8, 0))
-        ttk.Label(emby, textvariable=self.library_status, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
-        ttk.Label(emby, text="Or paste titles", style="Card.TLabel").pack(anchor="w")
-        ttk.Label(
-            emby,
-            text="One per line. A season already in Emby is left out. A later season that Emby does not have is added. Titles like Show S01E02 are matched to that season.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(0, 4))
-        self.paste = self._text(emby, 4)
-        self.paste.pack(fill="x")
-        self._button(emby, "Match pasted titles", self.match_pasted).pack(anchor="w", pady=(6, 0))
+        status = ttk.Label(page, textvariable=self.library_status, style="CardMuted.TLabel", wraplength=480)
+        status.pack(anchor="w", pady=(0, 6))
+        self._wrapping.append(status)
+        ttk.Label(page, text="Or paste titles", style="Card.TLabel").pack(anchor="w")
+        self._hint(
+            page,
+            "One per line. A season already in Emby is left out. A later season that Emby does not have is added.",
+            pady=(0, 4),
+        )
+        self._button(page, "Match pasted titles", self.match_pasted).pack(anchor="w", pady=(0, 6))
+        self.paste = self._text(page, 3)
+        self.paste.pack(fill="both", expand=True)
 
-        save = self._card(inner, "03", "Where the .strm files go")
-        folder = ttk.Frame(save, style="Card.TFrame")
+    def _build_output_tab(self, page: ttk.Frame) -> None:
+        ttk.Label(page, text="Save folder", style="Card.TLabel").pack(anchor="w", pady=(0, 4))
+        folder = ttk.Frame(page, style="Card.TFrame")
         folder.pack(fill="x")
         ttk.Entry(folder, textvariable=self.out_dir).pack(side="left", fill="x", expand=True)
         self._button(folder, "Browse", self.browse_out).pack(side="left", padx=(8, 0))
-        write_row = ttk.Frame(save, style="Card.TFrame")
-        write_row.pack(fill="x", pady=(8, 0))
+        write_row = ttk.Frame(page, style="Card.TFrame")
+        write_row.pack(fill="x", pady=(12, 0))
         self._button(write_row, "Write .strm files", self.write_files, accent=True).pack(side="left")
         self._button(write_row, "View plan", self.show_plan).pack(side="left", padx=(8, 0))
         self._button(write_row, "Save report", self.save_report).pack(side="left", padx=(8, 0))
-        ttk.Label(
-            save,
-            text="Write .strm files asks before it changes the folder. Matching files stay, new streams are added, and changed addresses are replaced. With automatic updates on, opening NimboVoD applies that same update without asking again. View plan shows what will be kept and left out.",
-            style="CardMuted.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", pady=(8, 0))
-
-        def bind_wheel(widget: tk.Misc) -> None:
-            if widget not in (self.link_list, self.source_list, self.paste, self.extra_tags):
-                widget.bind("<MouseWheel>", self._wheel_form)
-            for child in widget.winfo_children():
-                bind_wheel(child)
-
-        bind_wheel(inner)
+        self._hint(
+            page,
+            "Write .strm files asks before it changes the folder. Matching files stay, new streams are added, and changed addresses are replaced. Other files in the folder are left alone. View plan shows what will be kept and left out.",
+            pady=(10, 0),
+        )
 
     def _text(self, parent: tk.Misc, height: int) -> tk.Text:
         box = tk.Text(
@@ -1261,7 +1323,7 @@ class App(tk.Tk):
     def _labeled_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, placeholder: str) -> None:
         ttk.Label(parent, text=label, style="Card.TLabel").pack(anchor="w")
         ttk.Entry(parent, textvariable=variable).pack(fill="x", pady=(4, 2))
-        ttk.Label(parent, text=placeholder, style="CardMuted.TLabel", wraplength=400).pack(anchor="w", pady=(0, 6))
+        self._hint(parent, placeholder, pady=(0, 6))
 
     def show_plan(self) -> None:
         if not self.planned:
@@ -1354,6 +1416,9 @@ class App(tk.Tk):
     def _wheel_form(self, event: tk.Event) -> str:
         # One wheel flick can deliver dozens of events. Apply them together so
         # the form is redrawn once per frame instead of once per event.
+        target = self._canvas_for_widget(getattr(event, "widget", None))
+        if target is not None:
+            self._wheel_target = target
         self._wheel_pending += -event.delta / 120.0 * 72.0
         if self._wheel_job is None:
             self._wheel_job = self.after(16, self._apply_form_wheel)
@@ -1367,7 +1432,13 @@ class App(tk.Tk):
         if pixels == 0:
             return
         self._wheel_pending -= pixels
-        self.form_canvas.yview_scroll(pixels, "units")
+        canvas = self._wheel_target if self._wheel_target is not None else self.form_canvas
+        if canvas is not None:
+            try:
+                if canvas.winfo_exists():
+                    canvas.yview_scroll(pixels, "units")
+            except tk.TclError:
+                pass
         if abs(self._wheel_pending) >= 1:
             self._wheel_job = self.after(16, self._apply_form_wheel)
 
@@ -1518,7 +1589,25 @@ class App(tk.Tk):
                 fn()
         except queue.Empty:
             pass
-        self.after(30, self._poll_ui_calls)
+        try:
+            self._apply_tray_requests()
+        except Exception:
+            pass
+        if self.winfo_exists():
+            self.after(30, self._poll_ui_calls)
+
+    def _apply_tray_requests(self) -> None:
+        if not self._tray_requests:
+            return
+        pending = self._tray_requests
+        self._tray_requests = []
+        for action in pending:
+            if action == "minimize":
+                self._minimize_to_tray()
+            elif action == "open":
+                self._restore_from_tray()
+            elif action == "menu":
+                self._show_tray_menu()
 
     def _call_on_ui(self, fn):
         """Run fn on the window thread and wait until it has finished."""
@@ -1898,10 +1987,10 @@ class App(tk.Tk):
                 frame,
                 text="Every library is used until you load the list.",
                 style="CardMuted.TLabel",
-                wraplength=400,
+                wraplength=480,
             )
             note.pack(anchor="w")
-            note.bind("<MouseWheel>", self._wheel_form)
+            self._wrapping.append(note)
             return
         for item in self.emby_libraries:
             var = tk.IntVar(value=1 if item.get("selected") else 0)
@@ -2732,36 +2821,39 @@ class App(tk.Tk):
             return 0
 
     def _handle_window_message(self, message: int, wparam: int, lparam: int) -> bool:
-        if is_minimize_command(message, wparam):
-            self.after(0, self._minimize_to_tray)
+        # This runs inside the Windows message call. Touching Tk here aborts the program.
+        if is_minimize_command(message, wparam) and not self._tray_minimizing:
+            self._tray_requests.append("minimize")
             return True
         if message == WM_TRAY:
             action = tray_click(int(lparam) & 0xFFFF)
-            if self._in_tray and action == "open":
-                self.after(0, self._restore_from_tray)
-            elif self._in_tray and action == "menu":
-                self.after(0, self._show_tray_menu)
+            if action:
+                self._tray_requests.append(action)
             return True
         return False
 
     def _minimize_to_tray(self) -> bool:
-        if self._in_tray:
-            return True
-        if not self._tray_add():
-            try:
-                self.iconify()
-            except tk.TclError:
-                pass
-            return False
-        self._plan_hidden_for_tray = self._withdraw_plan_if_visible()
+        if self._in_tray or self._tray_minimizing:
+            return self._in_tray
+        self._tray_minimizing = True
         try:
-            self.withdraw()
-        except tk.TclError:
-            self._tray_remove()
-            self._plan_hidden_for_tray = False
-            return False
-        self._in_tray = True
-        return True
+            if not self._tray_add():
+                try:
+                    self.iconify()
+                except tk.TclError:
+                    pass
+                return False
+            self._plan_hidden_for_tray = self._withdraw_plan_if_visible()
+            try:
+                self.withdraw()
+            except tk.TclError:
+                self._tray_remove()
+                self._plan_hidden_for_tray = False
+                return False
+            self._in_tray = True
+            return True
+        finally:
+            self._tray_minimizing = False
 
     def _withdraw_plan_if_visible(self) -> bool:
         plan = self.plan_window
@@ -3041,7 +3133,7 @@ def self_check() -> None:
         plan_visible = bool(app.plan_window is not None and app.plan_window.winfo_viewable())
         user32, _shell32, _gdi32, _lresult = _prepare_tray_apis()
         user32.SendMessageW(app._tray_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
-        app.update()
+        app._apply_tray_requests()
         assert app._in_tray and app._tray_added
         assert not app.winfo_viewable()
         if plan_visible:
@@ -3053,6 +3145,7 @@ def self_check() -> None:
             assert app.plan_window.winfo_viewable()
         app.iconify()
         app.update()
+        app._apply_tray_requests()
         assert app._in_tray and not app.winfo_viewable()
         app._restore_from_tray()
         app._restore_from_tray()

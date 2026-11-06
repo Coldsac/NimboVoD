@@ -10,6 +10,8 @@ The program is not stored in git. Settings, including the API key, are saved in 
 
 Minimizing the window hides NimboVoD in the notification area. Click the icon to open it again, or right-click it and choose **Exit**.
 
+The window is split into **Playlists**, **File names**, **Emby**, **Output**, and **Settings**.
+
 **Settings**
 
 - **Run NimboVoD when Windows starts** opens the program when you sign in. It uses your account and does not need administrator rights.
