@@ -2,8 +2,8 @@
 """NimboVoD desktop window.
 
 Load M3U playlists, compare them with an Emby library, and write the .strm
-folder. Nothing is written or deleted until Write .strm files is confirmed,
-unless automatic updates are turned on in Settings.
+folder. Run does that full update. Write .strm files still asks before it
+changes the folder on its own. Settings can run the same steps automatically.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
 MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
 TREE_LIMIT = 2500
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 RELEASES_URL = "https://api.github.com/repos/Coldsac/NimboVoD/releases?per_page=30"
 
 LAYOUT_HINTS = {
@@ -1029,9 +1029,9 @@ class App(tk.Tk):
             wraplength=340,
         )
         self.header_blurb.pack(anchor="w", pady=(6, 0))
-        sample = ttk.Button(header, text="Preview sample", command=self.load_sample)
-        sample.pack(side="right", anchor="n", padx=(16, 0))
-        self._buttons.append(sample)
+        run = ttk.Button(header, text="Run", command=self.run_all, style="Accent.TButton")
+        run.pack(side="right", anchor="n", padx=(16, 0))
+        self._buttons.append(run)
 
         self.error_host = tk.Frame(self, bg=CANVAS)
         tk.Frame(self.error_host, bg=ERROR_LINE, width=3).pack(side="left", fill="y")
@@ -1861,6 +1861,20 @@ class App(tk.Tk):
         if not steps:
             self._schedule_refresh()
             return
+        self._start_pipeline(steps)
+
+    def run_all(self) -> None:
+        """Load playlists, pull Emby, then update the .strm folder."""
+        if self._busy or self._auto_running or self._auto_queue:
+            return
+        if not self.winfo_exists():
+            return
+        if self._startup_job is not None:
+            self.after_cancel(self._startup_job)
+            self._startup_job = None
+        self._start_pipeline(["playlists", "emby", "apply"])
+
+    def _start_pipeline(self, steps: list[str]) -> None:
         snapshot = self._auto_snapshot(steps)
         self._auto_running = True
         self._busy = True
@@ -1993,7 +2007,7 @@ class App(tk.Tk):
                 self._call_on_ui(lambda: self.status.set("Updating Emby library…"))
                 if not snapshot["emby"] or not snapshot["api_key"]:
                     emby_ok = False
-                    message = "Enter the Emby server address and API key before automatic library updates."
+                    message = "Enter the Emby server address and API key."
                     self._call_on_ui(lambda message=message: self._set_error(message))
                 elif snapshot.get("libraries") == []:
                     emby_ok = False
@@ -2098,7 +2112,7 @@ class App(tk.Tk):
         failures: list[str] = []
         total = len(files) + len(urls)
         if total == 0:
-            return loaded, ["Add a playlist link or playlist file before automatic loading."], 0
+            return loaded, ["Add a playlist link or playlist file."], 0
         number = 0
         for path in files:
             number += 1
@@ -3534,6 +3548,7 @@ def self_check() -> None:
         assert app.link_list.yview()[0] > before
         assert app._wheel_pending == 0
         app.link_list.delete(0, "end")
+        assert app._buttons[0].cget("text") == "Run"
         app.load_sample()
         app.show_plan()
         app.update()
@@ -3669,16 +3684,14 @@ def self_check() -> None:
             if app._tag_job is not None:
                 app.after_cancel(app._tag_job)
                 app._tag_job = None
-            snapshot = app._auto_snapshot(["playlists", "emby", "apply"])
-            app._auto_running = True
-            app._busy = True
-            worker = threading.Thread(target=lambda: app._auto_pipeline(snapshot), daemon=True)
-            worker.start()
+            app.run_all()
+            assert app._auto_running and app._busy
+            assert app._auto_queue == ["playlists", "emby", "apply"]
+            assert app._buttons[0].instate(["disabled"])
             deadline = time.time() + 15
-            while time.time() < deadline and worker.is_alive():
+            while time.time() < deadline and app._auto_running:
                 app.update()
                 time.sleep(0.02)
-            worker.join(2)
             assert order == ["playlist", "playlist", "emby", "write"], (order, problems, app.status.get())
             assert not problems, problems
             assert not app._auto_running

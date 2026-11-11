@@ -20,7 +20,7 @@ NimboVoD is a Windows desktop program. It runs on your computer, so a home-netwo
   <img src="docs/images/steps.png" width="760" alt="Three steps: load playlists, compare with Emby, write the folder">
 </p>
 
-The pictures below use **Preview sample**, example playlist links, and a stand-in server address.
+The pictures below use example playlist links, a stand-in server address, and the built-in sample playlist.
 
 <p align="center">
   <img src="docs/images/playlists.png" width="680" alt="Playlists tab with two M3U links, a loaded sample, and the Movies and TV layout">
@@ -29,6 +29,8 @@ The pictures below use **Preview sample**, example playlist links, and a stand-i
 ## The window
 
 The window opens on **Playlists**. The other tabs are **File names**, **Emby**, **Output**, and **Settings**.
+
+**Run** is at the top of the window. It loads the saved playlists, pulls Emby, then updates the `.strm` folder, in that order. It starts immediately. A failed playlist or Emby pull skips the folder write. **Load playlists**, **Pull library**, and **Write .strm files** still do one step at a time. **Write .strm files** asks before it changes the folder.
 
 Minimizing the window hides NimboVoD in the notification area. Click the icon to open it again. Right-click the icon and choose **Exit** to quit. The title-bar close button quits.
 
@@ -98,7 +100,7 @@ The options in that picture are an example. They start off, and **Refresh every*
 - **Automatically pull the Emby library** reads Emby with the saved address and API key.
 - **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out. That step does not ask again.
 
-Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest. After the playlists load, the bottom of the window shows when they were last pulled. That time stays until the next successful pull.
+**Run** does that full update immediately and does not use these checkboxes. Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest. After the playlists load, the bottom of the window shows when they were last pulled. That time stays until the next successful pull.
 
 **Check for updates** reads the [GitHub releases](https://github.com/Coldsac/NimboVoD/releases) and shows anything newer than this copy. **Open release page** opens that release so you can download it.
 
