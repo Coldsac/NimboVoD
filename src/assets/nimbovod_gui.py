@@ -40,7 +40,7 @@ ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
 MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
 TREE_LIMIT = 2500
-APP_VERSION = "1.12"
+APP_VERSION = "1.13"
 RELEASES_URL = "https://api.github.com/repos/Coldsac/NimboVoD/releases?per_page=30"
 
 LAYOUT_HINTS = {

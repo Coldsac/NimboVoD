@@ -58,6 +58,8 @@ QUALITY_TAGS = (
     "h265",
     "hevc",
     "aac",
+    "5.1",
+    "7.1",
     "dts-hd",
     "dts",
     "atmos",
@@ -83,6 +85,9 @@ QUALITY_TAGS = (
 QUALITY = re.compile(
     r"\[\s*(?:web|x26[45]|ts|10\s*bit)\s*\]"
     r"|-\s*(?:lama|world)\b"
+    # 5.1 and 5 1 are audio channels. Leaving them on the title hides a movie Emby already has.
+    r"|(?<![a-z0-9])(?:(?:dd|ddp|aac|ac-?3|eac-?3|dts)\s*)?(?:5|7)\s*[.\s]\s*1(?:\s*ch)?(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:dd|ddp|aac|ac-?3|eac-?3|dts)\s*2\s*[.\s]\s*0(?:\s*ch)?(?![a-z0-9])"
     r"|\[\s*\]"
     r"|\b(?:2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby(?:\s*vision)?|"
     r"web-?dl|web-?rip|bluray|blu-ray|bdrip|brrip|dvdrip|hdtv|hdrip|x264|x265|"
@@ -1013,6 +1018,20 @@ def self_test() -> None:
     assert strip_quality("Show Name S01E01-WORLD") == "Show Name S01E01"
     assert strip_quality("Show.Name.S01E01.1080p-LAMA") == "Show Name S01E01"
     assert strip_quality("The World S01E01 - WORLD") == "The World S01E01"
+    assert strip_quality("Heart Of The Beast (2026) 1080p WEBRip 5 1-LAMA") == "Heart Of The Beast (2026)"
+    assert strip_quality("Movie.Name.2024.DDP5.1-LAMA") == "Movie Name 2024"
+    assert strip_quality("Movie 7 1") == "Movie"
+    assert strip_quality("2.0 (2018)") == "2 0 (2018)"
+    beast = parse_m3u(
+        '#EXTM3U\n#EXTINF:-1 group-title="Movie VOD",Heart Of The Beast (2026) 1080p WEBRip 5 1-LAMA\nhttps://example.com/beast\n'
+    )
+    beast_plan = plan_entries(
+        beast,
+        [{"name": "Heart of the Beast", "year": 2026, "type": "Movie", "path": "Z:/Movies/Heart Of The Beast (2026)/movie.mkv"}],
+        {"layout": "library", "strip_quality": True, "use_years": True, "match_filenames": True},
+    )
+    assert beast_plan[0]["disposition"] == "drop", beast_plan[0]
+    assert beast_plan[0]["path"] == "Movies/Heart Of The Beast (2026).strm"
     assert normalize_title("Movie Megusta")[0] == "movie"
     copies = parse_m3u(
         "#EXTM3U\n"
