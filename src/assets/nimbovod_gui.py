@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 # The cleaner is loaded from a separate file, so PyInstaller only sees imports made here.
 import urllib.error
 import urllib.request
@@ -39,7 +40,7 @@ ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
 MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
 TREE_LIMIT = 2500
-APP_VERSION = "1.11"
+APP_VERSION = "1.12"
 RELEASES_URL = "https://api.github.com/repos/Coldsac/NimboVoD/releases?per_page=30"
 
 LAYOUT_HINTS = {
@@ -465,6 +466,8 @@ def apply_startup_registration(enabled: bool) -> str | None:
 
 # The first automatic update waits so a sign-in launch can find the network and the save folder.
 STARTUP_UPDATE_DELAY_MS = 60_000
+TAG_PLAN_DELAY_MS = 600
+PULL_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def auto_steps(pull_playlists: bool, pull_emby: bool, apply_strm: bool) -> list[str]:
@@ -584,6 +587,13 @@ def newer_releases(notes: list[dict], current: str) -> list[dict]:
     if current_key is None:
         return list(notes)
     return [note for note in notes if (version_key(note["tag"]) or ()) > current_key]
+
+
+def format_pull_time(moment: datetime) -> str:
+    """Local clock time for the last automatic playlist pull."""
+    hour = moment.hour % 12 or 12
+    suffix = "AM" if moment.hour < 12 else "PM"
+    return f"{PULL_MONTHS[moment.month - 1]} {moment.day}, {moment.year}, {hour}:{moment.minute:02d} {suffix}"
 
 
 def playlist_label(source: str) -> str:
@@ -738,6 +748,10 @@ class App(tk.Tk):
         super().__init__()
         self.cleaner = load_cleaner()
         self._tag_job: str | None = None
+        self._plan_token = 0
+        self._plan_running = False
+        self._plan_dirty = False
+        self.playlists_pulled_at = ""
         self._wheel_job: str | None = None
         self._wheel_pending = 0.0
         self._refresh_job: str | None = None
@@ -1045,7 +1059,19 @@ class App(tk.Tk):
             pady=8,
             font=("Segoe UI", 9),
         )
+        self.status_label = status
         status.pack(side="bottom", fill="x")
+        self.pull_log = tk.StringVar(value="")
+        self.pull_log_label = tk.Label(
+            self,
+            textvariable=self.pull_log,
+            bg=CANVAS,
+            fg=MUTED,
+            anchor="w",
+            padx=18,
+            pady=4,
+            font=("Segoe UI", 9),
+        )
         tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x")
 
         self.form_host = ttk.Frame(self)
@@ -1702,14 +1728,64 @@ class App(tk.Tk):
             return
         if self._tag_job is not None:
             self.after_cancel(self._tag_job)
-        self._tag_job = self.after(200, self._apply_tag_edit)
+        self._tag_job = self.after(TAG_PLAN_DELAY_MS, self._apply_tag_edit)
 
     def _apply_tag_edit(self) -> None:
         self._tag_job = None
         if not self._ready:
             return
-        self.build_plan()
         self._save_settings()
+        # A loaded playlist is tens of thousands of rows. Rebuilding it on the
+        # window thread makes each pause in this box freeze typing.
+        self._start_background_plan()
+
+    def _start_background_plan(self) -> None:
+        if self._plan_running:
+            self._plan_dirty = True
+            return
+        entries = [entry for source in self.sources for entry in source["entries"]]
+        library = self.library
+        options = self._plan_options()
+        self._plan_token += 1
+        token = self._plan_token
+        if not entries:
+            self.planned = []
+            self.fill_tree()
+            return
+        self._plan_running = True
+
+        def work() -> None:
+            planned = None
+            error = None
+            try:
+                planned = self.cleaner.plan_entries(entries, library, options)
+                for entry, row in zip(entries, planned):
+                    row["group"] = entry.get("group") or ""
+            except BaseException as exc:
+                error = exc
+
+            def deliver(planned=planned, error=error) -> None:
+                self._finish_background_plan(token, planned, error)
+
+            self._ui_calls.put(deliver)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_background_plan(self, token: int, planned, error) -> None:
+        self._plan_running = False
+        if not self.winfo_exists():
+            return
+        if token != self._plan_token:
+            return
+        if self._plan_dirty:
+            self._plan_dirty = False
+            self._start_background_plan()
+            return
+        if error is not None:
+            self._set_error(explain(error))
+            return
+        self.planned = planned
+        self.fill_tree()
 
     def _on_option(self, *_args) -> None:
         if not self._ready:
@@ -1909,6 +1985,7 @@ class App(tk.Tk):
                         self._refresh_sources()
                         self._auto_note = note
                         self._set_error(note)
+                        self._note_playlist_pull()
 
                     self._call_on_ui(apply_sources)
                     self._call_on_ui(lambda: self.status.set("Playlists updated."))
@@ -2133,6 +2210,17 @@ class App(tk.Tk):
 
     def _toggle_key(self) -> None:
         self.api_entry.configure(show="" if self.show_key.get() else "•")
+
+    def _note_playlist_pull(self) -> None:
+        moment = datetime.now().astimezone()
+        self.playlists_pulled_at = moment.isoformat(timespec="seconds")
+        self._show_pull_log(moment)
+        self._save_settings()
+
+    def _show_pull_log(self, moment: datetime) -> None:
+        self.pull_log.set(f"Playlists last pulled {format_pull_time(moment)}")
+        if self.pull_log_label.winfo_manager() != "pack":
+            self.pull_log_label.pack(side="bottom", fill="x", before=self.status_label)
 
     def _set_error(self, message: str) -> None:
         if message:
@@ -2615,6 +2703,8 @@ class App(tk.Tk):
         return str(path)
 
     def build_plan(self) -> None:
+        self._plan_token += 1
+        self._plan_dirty = False
         entries = [entry for source in self.sources for entry in source["entries"]]
         if not entries:
             self.planned = []
@@ -2846,6 +2936,7 @@ class App(tk.Tk):
                 if item.get("id") and item.get("name")
             ],
             "geometry": self.geometry(),
+            "playlistsPulledAt": self.playlists_pulled_at,
         }
 
     def _save_settings(self) -> None:
@@ -2933,6 +3024,15 @@ class App(tk.Tk):
         geometry = saved.get("geometry")
         if isinstance(geometry, str) and "x" in geometry:
             self.geometry(geometry)
+        pulled = saved.get("playlistsPulledAt")
+        if isinstance(pulled, str) and pulled.strip():
+            try:
+                moment = datetime.fromisoformat(pulled.strip())
+            except ValueError:
+                moment = None
+            if moment is not None:
+                self.playlists_pulled_at = moment.isoformat(timespec="seconds")
+                self._show_pull_log(moment)
 
     def _on_close(self) -> None:
         if self._wheel_job is not None:
@@ -2944,6 +3044,11 @@ class App(tk.Tk):
         if self._startup_job is not None:
             self.after_cancel(self._startup_job)
             self._startup_job = None
+        if self._tag_job is not None:
+            self.after_cancel(self._tag_job)
+            self._tag_job = None
+        self._plan_token += 1
+        self._plan_dirty = False
         pending = self.link_entry.get().strip()
         if pending:
             self.add_link()
@@ -3295,10 +3400,14 @@ def self_check() -> None:
                 "autoApplyStrm": True,
                 "refreshMinutes": 45,
                 "playlistFiles": [r"C:\playlists\test.m3u"],
+                "playlistsPulledAt": "2026-11-06T14:05:00",
             }
         ),
         encoding="utf-8",
     )
+    assert format_pull_time(datetime(2026, 11, 6, 14, 5)) == "Nov 6, 2026, 2:05 PM"
+    assert format_pull_time(datetime(2026, 1, 1, 0, 5)) == "Jan 1, 2026, 12:05 AM"
+    assert format_pull_time(datetime(2026, 1, 1, 12, 0)) == "Jan 1, 2026, 12:00 PM"
     assert version_key("v1.9") < version_key("v1.10")
     assert version_key("V1.10") == version_key("1.10")
     assert version_key("nightly") is None
@@ -3341,6 +3450,8 @@ def self_check() -> None:
     try:
         app = App()
         app.withdraw()
+        assert app.pull_log.get() == "Playlists last pulled Nov 6, 2026, 2:05 PM"
+        assert app.pull_log_label.winfo_manager() == "pack"
         assert not startup_registration_allowed()
         assert read_startup_command() == startup_before
         apply_startup_registration(True)
@@ -3475,6 +3586,41 @@ def self_check() -> None:
         app.layout.set("flat")
         app.build_plan()
         assert app.planned[0]["path"] == "The Matrix.strm", app.planned[0]["path"]
+        real_plan = app.cleaner.plan_entries
+        calls = {"thread": None}
+
+        def tracking_plan(entries, library, options):
+            calls["thread"] = threading.current_thread()
+            time.sleep(0.25)
+            return real_plan(entries, library, options)
+
+        app.cleaner.plan_entries = tracking_plan
+        try:
+            app._schedule_tags()
+            assert app._tag_job is not None
+            assert not app._plan_running
+            if app._tag_job is not None:
+                app.after_cancel(app._tag_job)
+                app._tag_job = None
+            started = time.perf_counter()
+            app._apply_tag_edit()
+            assert app._plan_running
+            assert calls["thread"] is not None
+            assert calls["thread"] is not threading.current_thread()
+            app.extra_tags.insert("end", "q")
+            assert "q" in app.extra_tags.get("1.0", "end")
+            assert time.perf_counter() - started < 0.2
+            deadline = time.time() + 5
+            while app._plan_running and time.time() < deadline:
+                app.update()
+                time.sleep(0.02)
+            assert not app._plan_running
+        finally:
+            app.cleaner.plan_entries = real_plan
+        app.extra_tags.delete("1.0", "end")
+        app.extra_tags.insert("1.0", "YTS")
+        app.build_plan()
+        assert app.planned[0]["path"] == "The Matrix.strm", app.planned[0]["path"]
         assert "left out" in app.summary.get()
         assert app.tree.item(children[0], "values")[2] in {"New", "Leave out"}
         order: list[str] = []
@@ -3539,6 +3685,11 @@ def self_check() -> None:
             assert not app._busy
             assert app.status.get().startswith("Added 1"), app.status.get()
             assert "left 2 unchanged" in app.status.get()
+            assert app.pull_log.get().startswith("Playlists last pulled ")
+            assert app.pull_log_label.winfo_manager() == "pack"
+            saved_pull = json.loads(Path(handle.name).read_text(encoding="utf-8"))
+            assert saved_pull.get("playlistsPulledAt") == app.playlists_pulled_at
+            assert datetime.fromisoformat(app.playlists_pulled_at)
         finally:
             import shutil
 

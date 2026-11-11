@@ -48,7 +48,7 @@ Add M3U links or choose local `.m3u` files, then click **Load playlists**. The s
   <img src="docs/images/names.png" width="680" alt="File names tab with quality tags, extra tags, and duplicate removal">
 </p>
 
-**Strip quality tags from file names** is on by default. It removes tags such as `1080p`, `x265`, and `[WEB]`. The full list is shown in the window. **Also strip these tags** removes extra words you type, both from file names and when matching Emby.
+**Strip quality tags from file names** is on by default. It removes tags such as `1080p`, `x265`, `[WEB]`, `[10BIT]`, `-LAMA`, and `-WORLD`. The full list is shown in the window. **Also strip these tags** removes extra words you type, both from file names and when matching Emby.
 
 **Remove duplicate .strm files** is on by default. The first stream that cleans up to the same file is kept. Later copies are left out, and numbered files already in the folder, such as `Name (2).strm`, are removed.
 
@@ -98,7 +98,7 @@ The options in that picture are an example. They start off, and **Refresh every*
 - **Automatically pull the Emby library** reads Emby with the saved address and API key.
 - **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out. That step does not ask again.
 
-Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest.
+Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest. After the playlists load, the bottom of the window shows when they were last pulled. That time stays until the next successful pull.
 
 **Check for updates** reads the [GitHub releases](https://github.com/Coldsac/NimboVoD/releases) and shows anything newer than this copy. **Open release page** opens that release so you can download it.
 

@@ -74,11 +74,15 @@ QUALITY_TAGS = (
     "[x265]",
     "[x264]",
     "[TS]",
+    "[10BIT]",
+    "-LAMA",
+    "-WORLD",
     "Megusta",
     "[ ]",
 )
 QUALITY = re.compile(
-    r"\[\s*(?:web|x26[45]|ts)\s*\]"
+    r"\[\s*(?:web|x26[45]|ts|10\s*bit)\s*\]"
+    r"|-\s*(?:lama|world)\b"
     r"|\[\s*\]"
     r"|\b(?:2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby(?:\s*vision)?|"
     r"web-?dl|web-?rip|bluray|blu-ray|bdrip|brrip|dvdrip|hdtv|hdrip|x264|x265|"
@@ -1004,6 +1008,11 @@ def self_test() -> None:
     assert show_by_title["Brand New Show S01E01"]["disposition"] == "keep"
     assert strip_quality("Movie [WEB] [x265] [x264] [TS] Megusta [ ]") == "Movie"
     assert strip_quality("Movie [1080p]") == "Movie"
+    assert strip_quality("Movie [10BIT]") == "Movie"
+    assert strip_quality("Movie.Name-LAMA") == "Movie Name"
+    assert strip_quality("Show Name S01E01-WORLD") == "Show Name S01E01"
+    assert strip_quality("Show.Name.S01E01.1080p-LAMA") == "Show Name S01E01"
+    assert strip_quality("The World S01E01 - WORLD") == "The World S01E01"
     assert normalize_title("Movie Megusta")[0] == "movie"
     copies = parse_m3u(
         "#EXTM3U\n"
