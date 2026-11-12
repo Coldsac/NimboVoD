@@ -6,3 +6,5 @@ __pycache__/
 nimbovod.exe
 .env
 .env.*
+plugin/**/bin/
+plugin/**/obj/

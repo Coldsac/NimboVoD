@@ -127,3 +127,24 @@ py -3.12 src/assets/nimbovod-cleaner.py --m3u https://example.com/a.m3u --out "D
 ```
 
 `--layout` is `group`, `flat`, or `library`. `--keep-quality` leaves quality tags in file names. `--strip-tag YTS` removes an extra tag. `--keep-duplicate-strm` keeps a second file when two streams clean up to the same name.
+
+## Emby plugin
+
+The Windows program stays as it is. The same playlist update can also run inside the Emby server.
+
+The plugin loads the M3U links and playlist files from its page, compares them with the library on that server, and updates the `.strm` folder. Matching follows the desktop program. A season already in Emby as real video is left out. An existing `.strm` file does not count as the library. Quality tags such as `5.1` and `7.1` are stripped before a movie is compared. A failed playlist or an empty library skips the folder write. The plugin writes nothing when it is installed. It writes when you turn on **Run now** and press **Save**, or when a refresh interval you saved comes due.
+
+Emby draws the page from the plugin. Open the server dashboard, choose **NimboVoD** in the server menu, or open **Plugins**, right-click NimboVoD, and choose **Settings**. The page has the M3U links, **Local M3U Files**, **Browse for an M3U file**, the save folder, the layout, and the library choice. **Read every library** starts off. **Libraries** is a checkbox list of the libraries to compare. Check at least one, unless you turn **Read every library** on. Browse opens this server's folders. Press **Save** to add that file to Local M3U Files. Turn on **View tags being removed** to show the tags stripped from file names, including any extra tags saved on the page. The plugin reads the library in the server process. Playlist paths and the save folder are paths on that server. Settings from the Windows program stay in `%LOCALAPPDATA%\NimboVoD\settings.json`.
+
+Build it with the .NET 8 SDK, from this repository:
+
+```
+dotnet build plugin/NimboVoD.Emby/NimboVoD.Emby.csproj -c Release
+dotnet test plugin/NimboVoD.Core.Tests/NimboVoD.Core.Tests.csproj -c Release
+```
+
+Download [NimboVoD.Emby.dll](https://github.com/Coldsac/NimboVoD/releases/download/plugin-1.1.7/NimboVoD.Emby.dll) from the [plugin 1.1.7 release](https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.7). Copy only that file into the server plugins folder. On Windows that folder is usually `%AppData%\Emby-Server\programdata\plugins` or `%ProgramData%\Emby-Server\programdata\plugins`. Leave the Emby assemblies out of that folder. Replace an older NimboVoD DLL if one is already there. Restart Emby. NimboVoD is in the server menu. The Windows program stays on the [v1.14 release](https://github.com/Coldsac/NimboVoD/releases/tag/v1.14) as `nimbovod.exe`.
+
+Turn on **Run now** and press **Save** to start one update. **Last result** changes to **Run started.**, then shows loading playlists, reading the library, and writing the folder. Reopen the page to see the latest line. A missing playlist, save folder, or library check is written there instead, and the update does not start. **Refresh every** repeats that update. `0` runs only when you use **Run now**. One minute is the shortest interval. Seven days is the longest.
+
+The plugin version is 1.1.7. It is separate from the Windows program's version.

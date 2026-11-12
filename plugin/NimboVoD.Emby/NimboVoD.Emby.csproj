@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyVersion>1.1.7.0</AssemblyVersion>
+    <FileVersion>1.1.7.0</FileVersion>
+    <Version>1.1.7</Version>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>NimboVoD.Emby</RootNamespace>
+    <Description>Turn M3U playlists into a .strm folder and leave out anything already in this Emby library.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MediaBrowser.Server.Core" Version="4.8.11">
+      <PrivateAssets>all</PrivateAssets>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="System.Memory" Version="4.5.5">
+      <PrivateAssets>all</PrivateAssets>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>
