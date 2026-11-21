@@ -1,9 +1,11 @@
 dist
+build
 __pycache__/
 *.pyc
 *.log
 .DS_Store
 nimbovod.exe
+nimbovod.spec
 .env
 .env.*
 plugin/**/bin/

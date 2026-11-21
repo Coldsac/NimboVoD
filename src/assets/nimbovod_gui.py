@@ -26,15 +26,16 @@ from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
 CANVAS = "#090b10"
-SURFACE = "#12151c"
-RAISED = "#1b2130"
-FIELD = "#0c0f14"
+SURFACE = "#131722"
+RAISED = "#1e2636"
+FIELD = "#0c0f16"
 FG = "#eef1f6"
 MUTED = "#8e97a8"
-LINE = "#2a3142"
+LINE = "#313a4f"
 ACCENT = "#6e8cff"
 ACCENT_ACTIVE = "#8aa4ff"
 SELECT = "#243454"
+RADIUS = 14
 ERROR_BG = "#1a1418"
 ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
@@ -142,6 +143,9 @@ def use_dark_titlebar(widget: tk.Misc) -> None:
                 break
         if applied:
             user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+        # Windows 11 rounds the frame. Older systems ignore this attribute.
+        preference = ctypes.c_int(2)
+        dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(preference), ctypes.sizeof(preference))
     except Exception:
         return
 
@@ -743,6 +747,471 @@ def report_text(planned: list[dict], source_label: str, compared: bool) -> str:
     return "\n".join(lines)
 
 
+def rounded_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, radius: float, **kwargs):
+    """Smooth polygon with quarter-circle corners. Tk has no corner radius of its own."""
+    radius = max(0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+
+
+def chrome_bg(widget: tk.Misc) -> str:
+    if isinstance(widget, ttk.Widget):
+        try:
+            style_name = str(widget.cget("style") or "")
+        except tk.TclError:
+            style_name = ""
+        if style_name.startswith("Card"):
+            return SURFACE
+        return CANVAS
+    try:
+        color = widget.cget("bg")
+    except tk.TclError:
+        return CANVAS
+    return color or CANVAS
+
+
+class RoundedCard(tk.Frame):
+    """A surface with a rounded outline. Children pack into ``inner``."""
+
+    def __init__(self, parent: tk.Misc, *, radius: int = RADIUS, pad: tuple[int, int] = (4, 4), fill: str = SURFACE, outline: str = LINE) -> None:
+        super().__init__(parent, bg=CANVAS, highlightthickness=0, bd=0)
+        self.radius = radius
+        self.fill = fill
+        self.outline = outline
+        self._shape = tk.Canvas(self, bg=CANVAS, highlightthickness=0, bd=0)
+        self._shape.place(x=0, y=0, relwidth=1, relheight=1)
+        self.inner = tk.Frame(self, bg=fill, highlightthickness=0, bd=0)
+        self.inner.pack(fill="both", expand=True, padx=radius + pad[0], pady=radius + pad[1])
+        self.inner.lift()
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, event: tk.Event) -> None:
+        if event.widget is not self or event.width < 4 or event.height < 4:
+            return
+        self._shape.delete("shape")
+        rounded_rect(
+            self._shape,
+            1,
+            1,
+            event.width - 2,
+            event.height - 2,
+            self.radius,
+            fill=self.fill,
+            outline=self.outline,
+            width=1,
+            tags="shape",
+        )
+
+
+class RoundButton(tk.Canvas):
+    """Pill button with the small piece of the ttk button API the window uses."""
+
+    def __init__(self, parent: tk.Misc, text: str, command=None, *, accent: bool = False, bg: str | None = None) -> None:
+        self._text = text
+        self._command = command
+        self._accent = accent
+        self._enabled = True
+        self._hover = False
+        self._pressed = False
+        self._chrome = bg or chrome_bg(parent)
+        import tkinter.font as tkfont
+
+        weight = "bold" if accent else "normal"
+        self._font = tkfont.Font(family="Segoe UI", size=10, weight=weight)
+        width = self._font.measure(text) + 36
+        super().__init__(
+            parent,
+            width=width,
+            height=36,
+            bg=self._chrome,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def _fill(self) -> str:
+        if not self._enabled:
+            return "#2a3348" if self._accent else "#171c27"
+        if self._accent:
+            return "#5876ea" if self._pressed else ACCENT_ACTIVE if self._hover else ACCENT
+        if self._pressed:
+            return "#2a3344"
+        return "#283246" if self._hover else RAISED
+
+    def _fg(self) -> str:
+        if not self._enabled:
+            return MUTED
+        return "#f7f8ff" if self._accent else FG
+
+    def _draw(self) -> None:
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1:
+            width = int(self.cget("width"))
+        if height <= 1:
+            height = int(self.cget("height"))
+        self.delete("all")
+        rounded_rect(self, 1, 1, width - 2, height - 2, height / 2, fill=self._fill(), outline=self._fill())
+        self.create_text(width / 2, height / 2, text=self._text, fill=self._fg(), font=self._font)
+
+    def _enter(self, _event: tk.Event) -> None:
+        self._hover = True
+        self._draw()
+
+    def _leave(self, _event: tk.Event) -> None:
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _press(self, _event: tk.Event) -> None:
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._draw()
+
+    def _release(self, event: tk.Event) -> None:
+        pressed = self._pressed
+        self._pressed = False
+        self._draw()
+        if not self._enabled or not pressed:
+            return
+        if 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height() and self._command:
+            self._command()
+
+    def state(self, statespec=None):
+        if statespec is None:
+            return ("disabled",) if not self._enabled else ()
+        for spec in statespec:
+            if spec == "disabled":
+                self._enabled = False
+            elif spec == "!disabled":
+                self._enabled = True
+        self.configure(cursor="hand2" if self._enabled else "arrow")
+        self._draw()
+
+    def instate(self, statespec, callback=None) -> bool:
+        ok = True
+        for spec in statespec:
+            if spec == "disabled":
+                ok = not self._enabled
+            elif spec == "!disabled":
+                ok = self._enabled
+            else:
+                ok = False
+            if not ok:
+                break
+        if ok and callback is not None:
+            callback()
+        return ok
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        return super().cget(key)
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf is not None and not kwargs:
+            if isinstance(cnf, str):
+                if cnf == "text":
+                    return self._text
+                return super().configure(cnf)
+            kwargs = dict(cnf)
+        state = kwargs.pop("state", None)
+        text = kwargs.pop("text", None)
+        if state is not None:
+            self._enabled = state != "disabled"
+            self.configure(cursor="hand2" if self._enabled else "arrow")
+        if text is not None:
+            self._text = text
+        if kwargs:
+            super().configure(**kwargs)
+        if state is not None or text is not None:
+            self._draw()
+
+    config = configure
+
+
+class RoundedEntry(tk.Canvas):
+    def __init__(self, parent: tk.Misc, *, textvariable: tk.StringVar | None = None, show: str = "", charwidth: int = 0, bg: str | None = None) -> None:
+        self._chrome = bg or chrome_bg(parent)
+        self._focused = False
+        width = charwidth * 10 + 32 if charwidth else 160
+        super().__init__(parent, height=36, width=width, bg=self._chrome, highlightthickness=0, bd=0)
+        self.entry = tk.Entry(
+            self,
+            textvariable=textvariable,
+            show=show,
+            relief="flat",
+            bd=0,
+            bg=FIELD,
+            fg=FG,
+            insertbackground=FG,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+            width=charwidth or 20,
+        )
+        self._win = self.create_window(14, 18, window=self.entry, anchor="w")
+        self.bind("<Configure>", self._redraw)
+        self.bind("<Button-1>", lambda _event: self.entry.focus_set())
+        self.entry.bind("<FocusIn>", lambda _event: self._set_focus(True))
+        self.entry.bind("<FocusOut>", lambda _event: self._set_focus(False))
+
+    def _set_focus(self, focused: bool) -> None:
+        self._focused = focused
+        self._redraw()
+
+    def _redraw(self, _event: tk.Event | None = None) -> None:
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1:
+            width = int(self.cget("width"))
+        if height <= 1:
+            height = int(self.cget("height"))
+        self.delete("shape")
+        rounded_rect(
+            self,
+            1,
+            1,
+            width - 2,
+            height - 2,
+            10,
+            fill=FIELD,
+            outline=ACCENT if self._focused else LINE,
+            tags="shape",
+        )
+        self.itemconfigure(self._win, width=max(12, width - 28))
+        self.coords(self._win, 14, height / 2)
+        self.tag_lower("shape")
+
+    def bind(self, sequence=None, func=None, add=None):
+        if sequence in ("<Return>", "<KP_Enter>"):
+            return self.entry.bind(sequence, func, add)
+        return super().bind(sequence, func, add)
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf is not None and not kwargs:
+            if isinstance(cnf, str):
+                if cnf == "show":
+                    return self.entry.cget("show")
+                return super().configure(cnf)
+            kwargs = dict(cnf)
+        if "show" in kwargs:
+            self.entry.configure(show=kwargs.pop("show"))
+        if kwargs:
+            super().configure(**kwargs)
+
+    config = configure
+
+
+class RoundedWell(tk.Canvas):
+    """Rounded outline around a list or text box. The child must be created on this canvas."""
+
+    def __init__(self, parent: tk.Misc, *, bg: str) -> None:
+        super().__init__(parent, bg=bg, highlightthickness=0, bd=0)
+        self.child: tk.Widget | None = None
+        self._focused = False
+        self._win = None
+        self.bind("<Configure>", self._redraw)
+
+    def adopt(self, child: tk.Widget) -> None:
+        self.child = child
+        self._win = self.create_window(12, 10, window=child, anchor="nw")
+        child.bind("<FocusIn>", lambda _event: self._set_focus(True), add="+")
+        child.bind("<FocusOut>", lambda _event: self._set_focus(False), add="+")
+        child.update_idletasks()
+        self.configure(height=max(40, child.winfo_reqheight() + 20))
+
+    def _set_focus(self, focused: bool) -> None:
+        self._focused = focused
+        self._redraw()
+
+    def _redraw(self, _event: tk.Event | None = None) -> None:
+        width = max(self.winfo_width(), 8)
+        height = max(self.winfo_height(), 8)
+        if self._win is None:
+            return
+        self.delete("shape")
+        rounded_rect(
+            self,
+            1,
+            1,
+            width - 2,
+            height - 2,
+            12,
+            fill=FIELD,
+            outline=ACCENT if self._focused else LINE,
+            tags="shape",
+        )
+        self.itemconfigure(self._win, width=max(12, width - 24), height=max(12, height - 20))
+        self.coords(self._win, 12, 10)
+        self.tag_lower("shape")
+
+
+class RoundCheck(tk.Canvas):
+    def __init__(self, parent: tk.Misc, text: str, variable: tk.IntVar, command=None, *, bg: str | None = None) -> None:
+        import tkinter.font as tkfont
+
+        self._text = text
+        self.variable = variable
+        self.command = command
+        self._font = tkfont.Font(family="Segoe UI", size=10)
+        self._chrome = bg or chrome_bg(parent)
+        super().__init__(
+            parent,
+            width=self._font.measure(text) + 40,
+            height=28,
+            bg=self._chrome,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.bind("<Button-1>", self._toggle)
+        self.variable.trace_add("write", lambda *_args: self._draw())
+        self.bind("<Configure>", lambda _event: self._draw())
+        self._draw()
+
+    def _toggle(self, _event: tk.Event | None = None) -> None:
+        self.variable.set(0 if self.variable.get() else 1)
+        if self.command is not None:
+            self.command()
+
+    def _draw(self) -> None:
+        if not self.winfo_exists():
+            return
+        self.delete("all")
+        selected = bool(self.variable.get())
+        box = RAISED if not selected else ACCENT
+        rounded_rect(self, 2, 5, 20, 23, 5, fill=box, outline=ACCENT if selected else LINE)
+        if selected:
+            self.create_line(6, 14, 9, 17, 16, 9, fill="#f7f8ff", width=2, capstyle="round", joinstyle="round")
+        self.create_text(28, 14, text=self._text, fill=FG, anchor="w", font=self._font)
+
+
+class Segmented(tk.Canvas):
+    """One rounded track, one choice lit. Writes the shared StringVar."""
+
+    def __init__(self, parent: tk.Misc, variable: tk.StringVar, choices: tuple[tuple[str, str], ...], *, bg: str | None = None, width: int | None = None) -> None:
+        self.variable = variable
+        self.choices = choices
+        self._chrome = bg or chrome_bg(parent)
+        super().__init__(parent, height=36, width=width or 10, bg=self._chrome, highlightthickness=0, bd=0)
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Button-1>", self._click)
+        self.variable.trace_add("write", lambda *_args: self._draw())
+
+    def _click(self, event: tk.Event) -> None:
+        width = self.winfo_width()
+        count = len(self.choices)
+        if width < 4 or count == 0:
+            return
+        index = int(event.x / (width / count))
+        index = max(0, min(count - 1, index))
+        self.variable.set(self.choices[index][0])
+
+    def _draw(self) -> None:
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        self.delete("all")
+        rounded_rect(self, 1, 1, width - 2, height - 2, height / 2, fill=FIELD, outline=LINE)
+        count = len(self.choices)
+        selected = next((index for index, (value, _label) in enumerate(self.choices) if value == self.variable.get()), 0)
+        segment = width / count
+        left = selected * segment + 3
+        right = (selected + 1) * segment - 3
+        rounded_rect(self, left, 3, right, height - 3, (height - 6) / 2, fill=RAISED, outline=RAISED)
+        import tkinter.font as tkfont
+
+        font = tkfont.Font(family="Segoe UI", size=10)
+        for index, (_value, label) in enumerate(self.choices):
+            self.create_text((index + 0.5) * segment, height / 2, text=label, fill=FG if index == selected else MUTED, font=font)
+
+
+class PillTabs(tk.Frame):
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent, bg=CANVAS, highlightthickness=0, bd=0)
+        self.track = tk.Canvas(self, height=44, bg=CANVAS, highlightthickness=0, bd=0)
+        self.track.pack(fill="x")
+        self.track.bind("<Configure>", lambda _event: self._draw())
+        self.track.bind("<Button-1>", self._click)
+        self.body = tk.Frame(self, bg=CANVAS, highlightthickness=0, bd=0)
+        self.body.pack(fill="both", expand=True, pady=(12, 0))
+        self.titles: list[str] = []
+        self.pages: list[tk.Frame] = []
+        self.selected = 0
+
+    def add(self, title: str) -> tk.Frame:
+        page = tk.Frame(self.body, bg=CANVAS, highlightthickness=0, bd=0)
+        self.titles.append(title)
+        self.pages.append(page)
+        if len(self.pages) == 1:
+            page.pack(fill="both", expand=True)
+        self._draw()
+        return page
+
+    def _click(self, event: tk.Event) -> None:
+        width = self.track.winfo_width()
+        count = len(self.titles)
+        if width < 4 or count == 0:
+            return
+        index = int(event.x / (width / count))
+        index = max(0, min(count - 1, index))
+        self.select(index)
+
+    def select(self, index: int) -> None:
+        if not self.pages:
+            return
+        self.selected = index
+        for page in self.pages:
+            page.pack_forget()
+        self.pages[index].pack(fill="both", expand=True)
+        self._draw()
+
+    def _draw(self) -> None:
+        width = self.track.winfo_width()
+        height = self.track.winfo_height()
+        if width <= 1 or height <= 1 or not self.titles:
+            return
+        self.track.delete("all")
+        rounded_rect(self.track, 1, 1, width - 2, height - 2, 14, fill=SURFACE, outline=LINE)
+        count = len(self.titles)
+        segment = width / count
+        left = self.selected * segment + 4
+        right = (self.selected + 1) * segment - 4
+        rounded_rect(self.track, left, 4, right, height - 4, 11, fill=RAISED, outline=RAISED)
+        import tkinter.font as tkfont
+
+        font = tkfont.Font(family="Segoe UI", size=10)
+        for index, title in enumerate(self.titles):
+            self.track.create_text(
+                (index + 0.5) * segment,
+                height / 2,
+                text=title,
+                fill=FG if index == self.selected else MUTED,
+                font=font,
+            )
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -786,8 +1255,8 @@ class App(tk.Tk):
         self._tray_minimizing = False
         self._tray_requests: list[str] = []
         self.title("NimboVoD")
-        self.geometry("640x720")
-        self.minsize(560, 640)
+        self.geometry("800x760")
+        self.minsize(700, 680)
         self.plan_window: tk.Toplevel | None = None
         self.updates_window: tk.Toplevel | None = None
         self.configure(bg=CANVAS)
@@ -915,7 +1384,7 @@ class App(tk.Tk):
             bordercolor=FIELD,
             lightcolor=FIELD,
             darkcolor=FIELD,
-            rowheight=30,
+            rowheight=32,
             font=("Segoe UI", 10),
         )
         style.configure(
@@ -994,15 +1463,24 @@ class App(tk.Tk):
         for orient in ("Vertical", "Horizontal"):
             style.configure(
                 f"{orient}.TScrollbar",
-                background=LINE,
+                background="#3c465c",
                 troughcolor=CANVAS,
                 bordercolor=CANVAS,
                 arrowcolor=MUTED,
                 lightcolor=CANVAS,
                 darkcolor=CANVAS,
-                arrowsize=12,
+                arrowsize=8,
+                gripcount=0,
             )
-            style.map(f"{orient}.TScrollbar", background=[("active", "#3c465c"), ("!active", LINE)])
+            style.map(f"{orient}.TScrollbar", background=[("active", "#5a657c"), ("!active", "#3c465c")])
+        style.layout(
+            "Vertical.TScrollbar",
+            [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})],
+        )
+        style.layout(
+            "Horizontal.TScrollbar",
+            [("Horizontal.Scrollbar.trough", {"sticky": "ew", "children": [("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})],
+        )
         self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", SELECT)
@@ -1011,43 +1489,45 @@ class App(tk.Tk):
         self.option_add("*TCombobox*Listbox.relief", "flat")
 
     def _build(self) -> None:
-        tk.Frame(self, bg=ACCENT, height=2).pack(fill="x")
         header = tk.Frame(self, bg=CANVAS)
-        header.pack(fill="x", padx=18, pady=(16, 10))
+        header.pack(fill="x", padx=22, pady=(18, 8))
+        mark = tk.Canvas(header, width=36, height=36, bg=CANVAS, highlightthickness=0, bd=0)
+        mark.pack(side="left", anchor="n", padx=(0, 12))
+        rounded_rect(mark, 1, 1, 35, 35, 11, fill=ACCENT, outline=ACCENT)
+        mark.create_polygon(14, 11, 14, 25, 26, 18, fill="#f7f8ff", outline="#f7f8ff")
         text = tk.Frame(header, bg=CANVAS)
         text.pack(side="left", fill="both", expand=True)
         tk.Label(text, text="PLAYLIST TO STRM", bg=CANVAS, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
-        tk.Label(text, text="NimboVoD", bg=CANVAS, fg=FG, font=("Segoe UI", 22)).pack(anchor="w", pady=(2, 0))
+        tk.Label(text, text="NimboVoD", bg=CANVAS, fg=FG, font=("Segoe UI", 22)).pack(anchor="w", pady=(1, 0))
         self.header_blurb = tk.Label(
             text,
             text="Playlists in, .strm files out, with anything already in Emby left out.",
             bg=CANVAS,
             fg=MUTED,
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             justify="left",
             anchor="w",
-            wraplength=340,
+            wraplength=420,
         )
-        self.header_blurb.pack(anchor="w", pady=(6, 0))
-        run = ttk.Button(header, text="Run", command=self.run_all, style="Accent.TButton")
+        self.header_blurb.pack(anchor="w", pady=(4, 0))
+        run = self._button(header, "Run", self.run_all, accent=True)
         run.pack(side="right", anchor="n", padx=(16, 0))
-        self._buttons.append(run)
 
         self.error_host = tk.Frame(self, bg=CANVAS)
-        tk.Frame(self.error_host, bg=ERROR_LINE, width=3).pack(side="left", fill="y")
+        self.error_well = tk.Canvas(self.error_host, bg=CANVAS, height=44, highlightthickness=0, bd=0)
+        self.error_well.pack(fill="x")
         self.error_label = tk.Label(
-            self.error_host,
+            self.error_well,
             text="",
             bg=ERROR_BG,
             fg=ERROR_FG,
             anchor="w",
             justify="left",
             wraplength=1040,
-            padx=12,
-            pady=8,
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
         )
-        self.error_label.pack(side="left", fill="both", expand=True)
+        self._error_win = self.error_well.create_window(16, 12, window=self.error_label, anchor="nw")
+        self.error_well.bind("<Configure>", lambda _event: self._redraw_error())
 
         status = tk.Label(
             self,
@@ -1055,9 +1535,9 @@ class App(tk.Tk):
             bg=CANVAS,
             fg=MUTED,
             anchor="w",
-            padx=18,
-            pady=8,
-            font=("Segoe UI", 9),
+            padx=22,
+            pady=10,
+            font=("Segoe UI", 10),
         )
         self.status_label = status
         status.pack(side="bottom", fill="x")
@@ -1068,14 +1548,14 @@ class App(tk.Tk):
             bg=CANVAS,
             fg=MUTED,
             anchor="w",
-            padx=18,
-            pady=4,
-            font=("Segoe UI", 9),
+            padx=22,
+            pady=2,
+            font=("Segoe UI", 10),
         )
-        tk.Frame(self, bg=LINE, height=1).pack(side="bottom", fill="x")
+        tk.Frame(self, bg="#1b2130", height=1).pack(side="bottom", fill="x")
 
         self.form_host = ttk.Frame(self)
-        self.form_host.pack(fill="both", expand=True, padx=18, pady=(2, 12))
+        self.form_host.pack(fill="both", expand=True, padx=22, pady=(6, 14))
         self._build_form()
         self.bind("<Configure>", self._on_resize)
         self.bind("<Map>", self._on_map, add="+")
@@ -1086,8 +1566,8 @@ class App(tk.Tk):
     def _on_resize(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
-        self.error_label.configure(wraplength=max(240, event.width - 90))
-        self.header_blurb.configure(wraplength=max(200, event.width - 230))
+        self._redraw_error()
+        self.header_blurb.configure(wraplength=max(200, event.width - 280))
         hint_width = max(220, event.width - 72)
         alive = []
         for label in self._wrapping:
@@ -1099,17 +1579,40 @@ class App(tk.Tk):
                 continue
         self._wrapping = alive
 
-    def _tab(self, notebook: ttk.Notebook, title: str) -> tk.Frame:
-        page = tk.Frame(notebook, bg=CANVAS)
-        notebook.add(page, text=title)
-        return page
+    def _redraw_error(self) -> None:
+        if getattr(self, "_drawing_error", False):
+            return
+        well = getattr(self, "error_well", None)
+        if well is None or not well.winfo_exists():
+            return
+        self._drawing_error = True
+        try:
+            self._redraw_error_now(well)
+        finally:
+            self._drawing_error = False
 
-    def _panel(self, parent: tk.Misc, *, expand: bool) -> ttk.Frame:
-        shell = tk.Frame(parent, bg=LINE, padx=1, pady=1)
-        shell.pack(fill="both" if expand else "x", expand=expand)
-        frame = ttk.Frame(shell, style="Card.TFrame", padding=(14, 12))
-        frame.pack(fill="both", expand=True)
-        return frame
+    def _redraw_error_now(self, well: tk.Canvas) -> None:
+        width = well.winfo_width()
+        if width < 20:
+            return
+        self.error_label.configure(wraplength=max(240, width - 40))
+        self.update_idletasks()
+        height = max(44, self.error_label.winfo_reqheight() + 24)
+        if int(well.cget("height")) != height:
+            well.configure(height=height)
+        well.delete("shape")
+        rounded_rect(well, 1, 1, width - 2, max(height, well.winfo_height()) - 2, 12, fill=ERROR_BG, outline=ERROR_LINE, tags="shape")
+        well.itemconfigure(self._error_win, width=max(40, width - 32))
+        well.coords(self._error_win, 16, 12)
+        well.tag_lower("shape")
+
+    def _tab(self, notebook: PillTabs, title: str) -> tk.Frame:
+        return notebook.add(title)
+
+    def _panel(self, parent: tk.Misc, *, expand: bool) -> tk.Frame:
+        card = RoundedCard(parent)
+        card.pack(fill="both" if expand else "x", expand=expand)
+        return card.inner
 
     def _hint(self, parent: tk.Misc, text: str, **pack) -> ttk.Label:
         label = ttk.Label(parent, text=text, style="CardMuted.TLabel", wraplength=480)
@@ -1117,34 +1620,56 @@ class App(tk.Tk):
         self._wrapping.append(label)
         return label
 
-    def _button(self, parent: tk.Misc, text: str, command, accent: bool = False) -> ttk.Button:
-        button = ttk.Button(parent, text=text, command=command, style="Accent.TButton" if accent else "TButton")
+    def _button(self, parent: tk.Misc, text: str, command, accent: bool = False) -> RoundButton:
+        button = RoundButton(parent, text, command, accent=accent)
         self._buttons.append(button)
         return button
 
+    def _entry(self, parent: tk.Misc, variable: tk.StringVar, *, show: str = "", charwidth: int = 0) -> RoundedEntry:
+        return RoundedEntry(parent, textvariable=variable, show=show, charwidth=charwidth)
+
+    def _check(self, parent: tk.Misc, text: str, variable: tk.IntVar, command=None) -> RoundCheck:
+        box = RoundCheck(parent, text, variable, command)
+        box.bind("<MouseWheel>", self._wheel_form)
+        return box
+
+    def _open_well(self, parent: tk.Misc) -> tuple[tk.Frame, RoundedWell]:
+        bg = chrome_bg(parent)
+        shell = tk.Frame(parent, bg=bg, highlightthickness=0, bd=0)
+        well = RoundedWell(shell, bg=bg)
+        well.pack(fill="both", expand=True)
+        return shell, well
+
+    def _pack_shell(self, child: tk.Widget, shell: tk.Frame) -> None:
+        def pack_shell(*_args, **kwargs):
+            shell.pack(**kwargs)
+
+        child.pack = pack_shell
+
     def _listbox(self, parent: tk.Misc, height: int) -> tk.Listbox:
+        shell, well = self._open_well(parent)
         box = tk.Listbox(
-            parent,
+            well,
             height=height,
             bg=FIELD,
             fg=FG,
             selectbackground=SELECT,
             selectforeground=FG,
-            highlightthickness=1,
-            highlightbackground=LINE,
-            highlightcolor=ACCENT,
+            highlightthickness=0,
             relief="flat",
             activestyle="none",
             font=("Segoe UI", 10),
             borderwidth=0,
         )
+        well.adopt(box)
         box.bind("<MouseWheel>", self._wheel_widget)
+        self._pack_shell(box, shell)
         return box
 
     def _build_form(self) -> None:
         self._wrapping = []
         self.form_canvas = None
-        notebook = ttk.Notebook(self.form_host, style="App.TNotebook")
+        notebook = PillTabs(self.form_host)
         notebook.pack(fill="both", expand=True)
         self.notebook = notebook
         self._tab_canvases: list[tk.Canvas] = []
@@ -1220,40 +1745,20 @@ class App(tk.Tk):
             widget = getattr(widget, "master", None)
         return None
 
-    def _build_settings_tab(self, page: ttk.Frame) -> None:
-        ttk.Checkbutton(
-            page,
-            text="Run NimboVoD when Windows starts",
-            variable=self.run_at_startup,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w")
+    def _build_settings_tab(self, page: tk.Frame) -> None:
+        self._check(page, "Run NimboVoD when Windows starts", self.run_at_startup).pack(anchor="w")
         self._hint(
             page,
             "Opens this program when you sign in. It uses your account, so administrator rights are not required.",
             pady=(2, 8),
         )
-        ttk.Checkbutton(
-            page,
-            text="Automatically pull the M3U playlists",
-            variable=self.auto_pull_playlists,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w")
-        ttk.Checkbutton(
-            page,
-            text="Automatically pull the Emby library",
-            variable=self.auto_pull_emby,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(4, 0))
-        ttk.Checkbutton(
-            page,
-            text="Automatically update the .strm folder",
-            variable=self.auto_apply_strm,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(4, 0))
-        timer = ttk.Frame(page, style="Card.TFrame")
+        self._check(page, "Automatically pull the M3U playlists", self.auto_pull_playlists).pack(anchor="w")
+        self._check(page, "Automatically pull the Emby library", self.auto_pull_emby).pack(anchor="w", pady=(4, 0))
+        self._check(page, "Automatically update the .strm folder", self.auto_apply_strm).pack(anchor="w", pady=(4, 0))
+        timer = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         timer.pack(fill="x", pady=(12, 0))
         ttk.Label(timer, text="Refresh every", style="Card.TLabel").pack(side="left")
-        ttk.Entry(timer, textvariable=self.refresh_minutes, width=6).pack(side="left", padx=(8, 6))
+        self._entry(timer, self.refresh_minutes, charwidth=6).pack(side="left", padx=(8, 6))
         ttk.Label(timer, text="minutes", style="Card.TLabel").pack(side="left")
         self._hint(
             page,
@@ -1262,7 +1767,7 @@ class App(tk.Tk):
             "Updating the folder does not ask again.",
             pady=(8, 0),
         )
-        updates = ttk.Frame(page, style="Card.TFrame")
+        updates = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         updates.pack(fill="x", pady=(14, 0))
         ttk.Label(updates, text=f"Version {APP_VERSION}", style="Card.TLabel").pack(side="left")
         self.update_button = self._button(updates, "Check for updates", self.check_updates)
@@ -1281,47 +1786,37 @@ class App(tk.Tk):
             pady=(4, 0),
         )
 
-    def _build_playlist_tab(self, page: ttk.Frame) -> None:
+    def _build_playlist_tab(self, page: tk.Frame) -> None:
         ttk.Label(page, text="M3U links", style="Card.TLabel").pack(anchor="w")
-        row = ttk.Frame(page, style="Card.TFrame")
+        row = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         row.pack(fill="x", pady=(4, 6))
-        entry = ttk.Entry(row, textvariable=self.link_entry)
+        entry = self._entry(row, self.link_entry)
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda _event: self.add_link())
         self._button(row, "Add", self.add_link).pack(side="left", padx=(8, 0))
         self.link_list = self._listbox(page, 4)
-        self.link_list.pack(fill="both", expand=True, pady=(0, 6))
-        actions = ttk.Frame(page, style="Card.TFrame")
+        self.link_list.pack(fill="x", pady=(0, 6))
+        actions = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         actions.pack(fill="x")
         self._button(actions, "Remove link", self.remove_link).pack(side="left")
         self._button(actions, "Add playlist files", self.add_files).pack(side="left", padx=(8, 0))
         self._button(actions, "Load playlists", self.load_links, accent=True).pack(side="right")
         ttk.Label(page, text="Loaded", style="Card.TLabel").pack(anchor="w", pady=(12, 4))
         self.source_list = self._listbox(page, 3)
-        self.source_list.pack(fill="both", expand=True)
+        self.source_list.pack(fill="x")
         self._button(page, "Remove loaded playlist", self.remove_source).pack(anchor="w", pady=(6, 10))
         ttk.Label(page, text="Folder layout", style="Card.TLabel").pack(anchor="w")
-        radios = ttk.Frame(page, style="Card.TFrame")
-        radios.pack(fill="x", pady=(4, 4))
-        for value, label in (("group", "By group"), ("flat", "Flat"), ("library", "Movies & TV")):
-            ttk.Radiobutton(
-                radios,
-                text=label,
-                value=value,
-                variable=self.layout,
-                style="Card.TRadiobutton",
-            ).pack(side="left", padx=(0, 12))
+        Segmented(
+            page,
+            self.layout,
+            (("group", "By group"), ("flat", "Flat"), ("library", "Movies & TV")),
+        ).pack(fill="x", pady=(4, 4))
         hint = ttk.Label(page, textvariable=self.layout_hint, style="CardMuted.TLabel", wraplength=480)
         hint.pack(anchor="w")
         self._wrapping.append(hint)
 
-    def _build_names_tab(self, page: ttk.Frame) -> None:
-        ttk.Checkbutton(
-            page,
-            text="Strip quality tags from file names",
-            variable=self.strip_quality,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(0, 8))
+    def _build_names_tab(self, page: tk.Frame) -> None:
+        self._check(page, "Strip quality tags from file names", self.strip_quality).pack(anchor="w", pady=(0, 8))
         ttk.Label(page, text="Quality tags already removed", style="Card.TLabel").pack(anchor="w")
         self._hint(page, ", ".join(self.cleaner.QUALITY_TAGS), pady=(2, 10))
         ttk.Label(page, text="Also strip these tags", style="Card.TLabel").pack(anchor="w")
@@ -1332,12 +1827,7 @@ class App(tk.Tk):
         )
         self.extra_tags = self._text(page, 6)
         self.extra_tags.pack(fill="both", expand=True)
-        ttk.Checkbutton(
-            page,
-            text="Remove duplicate .strm files",
-            variable=self.drop_duplicate_strm,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(10, 0))
+        self._check(page, "Remove duplicate .strm files", self.drop_duplicate_strm).pack(anchor="w", pady=(10, 0))
         self._hint(
             page,
             "When two streams clean up to the same file, the first is kept. Numbered copies already in the folder, such as Name (2).strm, are removed too.",
@@ -1347,24 +1837,18 @@ class App(tk.Tk):
     def _build_emby_tab(self, page: ttk.Frame) -> None:
         self._labeled_entry(page, "Server address", self.emby, "http://192.168.1.20:8096")
         self._hint(page, "A 192.168 address works here. This program runs on your computer.", pady=(0, 6))
-        key_row = ttk.Frame(page, style="Card.TFrame")
+        key_row = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         key_row.pack(fill="x")
         ttk.Label(key_row, text="API key", style="Card.TLabel").pack(side="left")
-        ttk.Checkbutton(
-            key_row,
-            text="Show",
-            variable=self.show_key,
-            command=self._toggle_key,
-            style="Card.TCheckbutton",
-        ).pack(side="right")
-        self.api_entry = ttk.Entry(page, textvariable=self.api_key, show="•")
+        self._check(key_row, "Show", self.show_key, self._toggle_key).pack(side="right")
+        self.api_entry = self._entry(page, self.api_key, show="•")
         self.api_entry.pack(fill="x", pady=(4, 6))
         self._labeled_entry(page, "User id", self.user_id, "Optional. Leave blank to read the whole server.")
-        library_head = ttk.Frame(page, style="Card.TFrame")
+        library_head = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         library_head.pack(fill="x", pady=(4, 4))
         ttk.Label(library_head, text="Libraries", style="Card.TLabel").pack(side="left")
         self._button(library_head, "Load libraries", self.load_emby_libraries).pack(side="right")
-        self.library_choice = ttk.Frame(page, style="Card.TFrame")
+        self.library_choice = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         self.library_choice.pack(fill="x")
         self._hint(
             page,
@@ -1372,7 +1856,7 @@ class App(tk.Tk):
             pady=(2, 6),
         )
         self._render_library_choices()
-        emby_actions = ttk.Frame(page, style="Card.TFrame")
+        emby_actions = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         emby_actions.pack(fill="x", pady=(2, 6))
         self._button(emby_actions, "Pull library", self.pull_emby, accent=True).pack(side="left")
         self._button(emby_actions, "Upload export", self.upload_library).pack(side="left", padx=(8, 0))
@@ -1392,11 +1876,11 @@ class App(tk.Tk):
 
     def _build_output_tab(self, page: ttk.Frame) -> None:
         ttk.Label(page, text="Save folder", style="Card.TLabel").pack(anchor="w", pady=(0, 4))
-        folder = ttk.Frame(page, style="Card.TFrame")
+        folder = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         folder.pack(fill="x")
-        ttk.Entry(folder, textvariable=self.out_dir).pack(side="left", fill="x", expand=True)
+        self._entry(folder, self.out_dir).pack(side="left", fill="x", expand=True)
         self._button(folder, "Browse", self.browse_out).pack(side="left", padx=(8, 0))
-        write_row = ttk.Frame(page, style="Card.TFrame")
+        write_row = tk.Frame(page, bg=SURFACE, highlightthickness=0, bd=0)
         write_row.pack(fill="x", pady=(12, 0))
         self._button(write_row, "Write .strm files", self.write_files, accent=True).pack(side="left")
         self._button(write_row, "View plan", self.show_plan).pack(side="left", padx=(8, 0))
@@ -1408,8 +1892,9 @@ class App(tk.Tk):
         )
 
     def _text(self, parent: tk.Misc, height: int) -> tk.Text:
+        shell, well = self._open_well(parent)
         box = tk.Text(
-            parent,
+            well,
             height=height,
             bg=FIELD,
             fg=FG,
@@ -1417,21 +1902,21 @@ class App(tk.Tk):
             selectbackground=SELECT,
             selectforeground=FG,
             relief="flat",
-            highlightthickness=1,
-            highlightbackground=LINE,
-            highlightcolor=ACCENT,
+            highlightthickness=0,
             font=("Segoe UI", 10),
             wrap="word",
             padx=8,
             pady=6,
             borderwidth=0,
         )
+        well.adopt(box)
         box.bind("<MouseWheel>", self._wheel_widget)
+        self._pack_shell(box, shell)
         return box
 
-    def _labeled_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, placeholder: str) -> None:
+    def _labeled_entry(self, parent: tk.Misc, label: str, variable: tk.StringVar, placeholder: str) -> None:
         ttk.Label(parent, text=label, style="Card.TLabel").pack(anchor="w")
-        ttk.Entry(parent, textvariable=variable).pack(fill="x", pady=(4, 2))
+        self._entry(parent, variable).pack(fill="x", pady=(4, 2))
         self._hint(parent, placeholder, pady=(0, 6))
 
     def show_plan(self) -> None:
@@ -1453,10 +1938,9 @@ class App(tk.Tk):
         window.minsize(640, 420)
         window.transient(self)
         window.after_idle(lambda window=window: use_dark_titlebar(window))
-        tk.Frame(window, bg=ACCENT, height=2).pack(fill="x")
         body = tk.Frame(window, bg=CANVAS)
-        body.pack(fill="both", expand=True, padx=18, pady=16)
-        tk.Label(body, text="Plan", bg=CANVAS, fg=FG, font=("Segoe UI", 16)).pack(anchor="w")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+        tk.Label(body, text="Plan", bg=CANVAS, fg=FG, font=("Segoe UI", 20)).pack(anchor="w")
         summary = tk.Label(
             body,
             textvariable=self.summary,
@@ -1476,17 +1960,16 @@ class App(tk.Tk):
         window.bind("<Configure>", _fit_summary)
         filters = tk.Frame(body, bg=CANVAS)
         filters.pack(fill="x", pady=(12, 10))
-        ttk.Combobox(
+        Segmented(
             filters,
-            textvariable=self.filter_mode,
-            values=("All", "New files", "Left out"),
-            state="readonly",
-            width=12,
+            self.filter_mode,
+            (("All", "All"), ("New files", "New files"), ("Left out", "Left out")),
+            width=300,
         ).pack(side="left")
-        ttk.Entry(filters, textvariable=self.query).pack(side="left", fill="x", expand=True, padx=(8, 0))
-        table = tk.Frame(body, bg=LINE, padx=1, pady=1)
+        self._entry(filters, self.query).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        table = RoundedCard(body, fill=FIELD, outline=LINE, pad=(0, 0), radius=12)
         table.pack(fill="both", expand=True)
-        frame = tk.Frame(table, bg=FIELD)
+        frame = tk.Frame(table.inner, bg=FIELD, highlightthickness=0, bd=0)
         frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(
             frame,
@@ -1581,10 +2064,9 @@ class App(tk.Tk):
         window.transient(self)
         window.after_idle(lambda window=window: use_dark_titlebar(window))
         window.protocol("WM_DELETE_WINDOW", self._close_updates)
-        tk.Frame(window, bg=ACCENT, height=2).pack(fill="x")
         body = tk.Frame(window, bg=CANVAS)
-        body.pack(fill="both", expand=True, padx=18, pady=16)
-        tk.Label(body, text="Updates", bg=CANVAS, fg=FG, font=("Segoe UI", 16)).pack(anchor="w")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+        tk.Label(body, text="Updates", bg=CANVAS, fg=FG, font=("Segoe UI", 20)).pack(anchor="w")
         if newer:
             count = len(newer)
             summary = f"This copy is {APP_VERSION}. {count} newer release{' is' if count == 1 else 's are'} on GitHub."
@@ -1602,23 +2084,8 @@ class App(tk.Tk):
             anchor="w",
             wraplength=620,
         ).pack(anchor="w", pady=(4, 10))
-        text = tk.Text(
-            body,
-            bg=FIELD,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=LINE,
-            highlightcolor=ACCENT,
-            font=("Segoe UI", 10),
-            wrap="word",
-            padx=8,
-            pady=6,
-            borderwidth=0,
-        )
+        text = self._text(body, 12)
         text.pack(fill="both", expand=True)
-        text.bind("<MouseWheel>", self._wheel_widget)
         blocks = []
         for note in shown:
             heading = note["name"] if note["name"] != note["tag"] else note["tag"]
@@ -1631,12 +2098,7 @@ class App(tk.Tk):
         if target:
             actions = tk.Frame(body, bg=CANVAS)
             actions.pack(fill="x", pady=(12, 0))
-            ttk.Button(
-                actions,
-                text="Open release page",
-                command=lambda url=target: self._open_release(url),
-                style="Accent.TButton",
-            ).pack(side="right")
+            RoundButton(actions, "Open release page", lambda url=target: self._open_release(url), accent=True, bg=CANVAS).pack(side="right")
 
     def _finish_update_check_chrome(self) -> None:
         self._update_checking = False
@@ -2248,7 +2710,8 @@ class App(tk.Tk):
         if message:
             self.error_label.configure(text=message)
             if not self.error_host.winfo_manager():
-                self.error_host.pack(fill="x", padx=18, pady=(0, 8), before=self.form_host)
+                self.error_host.pack(fill="x", padx=22, pady=(0, 8), before=self.form_host)
+                self.after_idle(self._redraw_error)
         elif self.error_host.winfo_manager():
             self.error_host.pack_forget()
 
@@ -2342,13 +2805,7 @@ class App(tk.Tk):
         for item in self.emby_libraries:
             var = tk.IntVar(value=1 if item.get("selected") else 0)
             self._library_vars.append(var)
-            check = ttk.Checkbutton(
-                frame,
-                text=self._library_choice_text(item),
-                variable=var,
-                command=self._store_library_checks,
-                style="Card.TCheckbutton",
-            )
+            check = self._check(frame, self._library_choice_text(item), var, self._store_library_checks)
             check.pack(anchor="w")
             check.bind("<MouseWheel>", self._wheel_form)
 
