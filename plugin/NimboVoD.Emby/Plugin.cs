@@ -92,13 +92,16 @@ namespace NimboVoD.Emby
                 catch (Exception)
                 {
                 }
-                if (!options.RunNow)
+                var write = options.RunNow;
+                var clean = options.CleanFolders;
+                if (!write && !clean)
                 {
                     return;
                 }
                 options.RunNow = false;
+                options.CleanFolders = false;
                 var problem = RefreshTask.StartProblem(options);
-                options.LastResult = problem ?? "Run started.";
+                options.LastResult = problem ?? (write ? "Run started." : "Clean up started.");
                 try
                 {
                     SaveOptions(options);
@@ -110,7 +113,7 @@ namespace NimboVoD.Emby
                 {
                     return;
                 }
-                Task.Run(() => RunNowAsync());
+                Task.Run(() => RunNowAsync(write, clean));
             }
             finally
             {
@@ -118,14 +121,14 @@ namespace NimboVoD.Emby
             }
         }
 
-        private async Task RunNowAsync()
+        private async Task RunNowAsync(bool write, bool clean)
         {
             try
             {
                 var library = _host.Resolve<ILibraryManager>();
                 var logs = _host.Resolve<ILogManager>();
                 var task = new RefreshTask(library, logs);
-                await task.Execute(CancellationToken.None, new Progress<double>()).ConfigureAwait(false);
+                await task.ExecuteManual(CancellationToken.None, new Progress<double>(), write, clean).ConfigureAwait(false);
             }
             catch (Exception exc)
             {

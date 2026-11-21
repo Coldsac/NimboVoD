@@ -10,15 +10,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/v1.14"><strong>Standalone v1.14</strong></a>
+  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/v1.15"><strong>Standalone v1.15</strong></a>
   ·
-  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.7"><strong>Emby plugin 1.1.7</strong></a><br>
+  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.8"><strong>Emby plugin 1.1.8</strong></a><br>
   Windows 10 or newer · 64-bit program · server plugin
 </p>
 
 NimboVoD runs in two ways. **Standalone** is a window on your PC. The **Emby plugin** runs inside the server. Both load M3U playlists, leave out anything already in the Emby library, and update a folder of `.strm` files. Each one keeps its own settings.
 
-Standalone uses a home-network address such as `http://192.168.1.20:8096` and an API key. Windows may say it protected your PC because `nimbovod.exe` is not signed. Choose **More info**, then **Run anyway**. The [Standalone v1.14](https://github.com/Coldsac/NimboVoD/releases/tag/v1.14) release is the latest Windows download.
+Standalone uses a home-network address such as `http://192.168.1.20:8096` and an API key. Windows may say it protected your PC because `nimbovod.exe` is not signed. Choose **More info**, then **Run anyway**. The [Standalone v1.15](https://github.com/Coldsac/NimboVoD/releases/tag/v1.15) release is the latest Windows download.
 
 <p align="center">
   <img src="docs/images/steps.png" width="760" alt="Three steps: load playlists, compare with Emby, write the folder">
@@ -46,7 +46,7 @@ Add M3U links or choose local `.m3u` files, then click **Load playlists**. The s
 
 - **By group** puts each group-title in its own folder.
 - **Flat** puts every file in one folder.
-- **Movies & TV** uses `Movies/` for movies and `TV/Show/Season 01/` for episodes.
+- **Movies & TV** uses `Movies/Name (Year)/Name (Year).strm` for movies and `TV/Show/Season 01/` for episodes.
 
 ### File names
 
@@ -88,7 +88,7 @@ A season Emby already has as real video is left out entirely. A season Emby does
 
 Choose the save folder.
 
-- **Write .strm files** asks before it changes the folder. It adds new files and replaces a file whose address changed. A file whose text already matches is left as it is. A file the plan leaves out is removed only when that path is part of the plan. Other files in the folder stay.
+- **Write .strm files** asks before it changes the folder. It adds new files and replaces a file whose address changed. A file whose text already matches is left as it is. A file the plan leaves out is removed only when that path is part of the plan. Removing that file also removes the empty folders above it. The save folder itself stays. Other files in the folder stay.
 - **Save report** writes the plan to a text file.
 
 ### Settings
@@ -107,6 +107,8 @@ The options in that picture are an example. They start off, and **Refresh every*
 **Run** does that full update immediately and does not use these checkboxes. Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest. After the playlists load, the bottom of the window shows when they were last pulled. That time stays until the next successful pull.
 
 **Check for updates** reads the [GitHub releases](https://github.com/Coldsac/NimboVoD/releases) and shows a newer Standalone version. **Open release page** opens that release so you can download it. The plugin release is separate.
+
+**Clean up folders** asks before it changes the folder. It deletes `.strm` files that are no longer in the loaded playlists, moves the ones that stay into the current folders, and removes folders left empty. Files that are not `.strm` files stay. Load a playlist first. When an Emby library is loaded, files the plan leaves out are removed too.
 
 ## Settings file
 
@@ -136,7 +138,7 @@ py -3.12 src/assets/nimbovod-cleaner.py --m3u https://example.com/a.m3u --out "D
 
 The plugin does the same playlist update from inside Emby. It reads that server's library in the server process, so the page has no server address and no API key. Playlist paths and the save folder are paths on that server. Installing it does not write `.strm` files.
 
-Download [NimboVoD.Emby.dll](https://github.com/Coldsac/NimboVoD/releases/download/plugin-1.1.7/NimboVoD.Emby.dll) from the [plugin 1.1.7 release](https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.7). Copy only that file into the server plugins folder. On Windows that folder is usually `%AppData%\Emby-Server\programdata\plugins` or `%ProgramData%\Emby-Server\programdata\plugins`. Leave every other build file out of that folder. Replace an older NimboVoD DLL if one is already there, then restart Emby.
+Download [NimboVoD.Emby.dll](https://github.com/Coldsac/NimboVoD/releases/download/plugin-1.1.8/NimboVoD.Emby.dll) from the [plugin 1.1.8 release](https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.8). Copy only that file into the server plugins folder. On Windows that folder is usually `%AppData%\Emby-Server\programdata\plugins` or `%ProgramData%\Emby-Server\programdata\plugins`. Leave every other build file out of that folder. Replace an older NimboVoD DLL if one is already there, then restart Emby.
 
 Open the server dashboard and choose **NimboVoD** in the server menu, or open **Plugins**, right-click NimboVoD, and choose **Settings**. Emby draws the page from the plugin.
 
@@ -152,12 +154,13 @@ Open the server dashboard and choose **NimboVoD** in the server menu, or open **
 - **Read every library** starts off. **Libraries** lists the libraries on this server. Check the ones to compare. With the box off and nothing checked, the update stops and **Last result** asks you to select at least one library.
 - **Refresh every** is in minutes. `0` runs only when you use **Run now**. One minute is the shortest interval. Seven days is the longest.
 - **Run now** starts one update when you press **Save**. The box clears when the update starts.
+- **Clean up folders** starts one clean up when you press **Save**. `.strm` files that are no longer in the playlists are deleted, files that stay are moved into the current folders, and empty folders are removed. The box clears when the clean up starts.
 
-**Last result** shows the step in progress: **Run started.**, **Loading playlists.**, **Reading the Emby library.**, **Writing the .strm folder.**, then the added, updated, unchanged, and removed counts. Reopen the page to see the latest line. A missing playlist, save folder, or library check is written there, and the folder is not changed. If every playlist fails, or Emby returns nothing to compare, the folder is left as it is. A failed playlist with another playlist that loaded still updates the folder and puts the failure in **Last result**.
+**Last result** shows the step in progress: **Run started.** or **Clean up started.**, **Loading playlists.**, **Reading the Emby library.**, **Writing the .strm folder.**, **Cleaning up the .strm folder.**, then the counts. Reopen the page to see the latest line. A missing playlist, save folder, or library check is written there, and the folder is not changed. If every playlist fails, or Emby returns nothing to compare, the folder is left as it is. A failed playlist with another playlist that loaded still updates the folder and puts the failure in **Last result**.
 
-Matching follows Standalone. A season already in Emby as real video is left out. A season it does not have is still added. An existing `.strm` file does not count as the library. A run adds new files, replaces a file whose address changed, and removes a planned file the library already has.
+Matching follows Standalone. A season already in Emby as real video is left out. A season it does not have is still added. An existing `.strm` file does not count as the library. A run adds new files, replaces a file whose address changed, and removes a planned file the library already has. Removing that file also removes the empty folders above it.
 
-The plugin version is 1.1.7. Standalone is 1.14.
+The plugin version is 1.1.8. Standalone is 1.15.
 
 Build the plugin with the .NET 8 SDK, from this repository:
 

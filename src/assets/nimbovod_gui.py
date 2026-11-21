@@ -40,13 +40,13 @@ ERROR_FG = "#f0c8d0"
 ERROR_LINE = "#c45d6e"
 MAX_PLAYLIST_BYTES = 80 * 1024 * 1024
 TREE_LIMIT = 2500
-APP_VERSION = "1.14"
+APP_VERSION = "1.15"
 RELEASES_URL = "https://api.github.com/repos/Coldsac/NimboVoD/releases?per_page=30"
 
 LAYOUT_HINTS = {
     "group": "One folder per group-title. The same stream URL in two playlists is kept once.",
     "flat": "Every .strm file goes in a single folder.",
-    "library": "Movies go in Movies/. Episodes go under TV/Show/Season 01/.",
+    "library": "Movies go in Movies/Name (Year)/. Episodes go under TV/Show/Season 01/.",
 }
 
 SAMPLE_PLAYLIST = """#EXTM3U
@@ -1270,6 +1270,14 @@ class App(tk.Tk):
         self._hint(
             page,
             "Looks at the GitHub releases and shows anything newer than this copy.",
+            pady=(4, 0),
+        )
+        cleanup = ttk.Frame(page, style="Card.TFrame")
+        cleanup.pack(fill="x", pady=(14, 0))
+        self._button(cleanup, "Clean up folders", self.clean_folders).pack(side="left")
+        self._hint(
+            page,
+            "Deletes .strm files that are no longer in the loaded playlists, moves the ones that stay into the current folders, and removes folders left empty. Other files stay.",
             pady=(4, 0),
         )
 
@@ -2902,6 +2910,66 @@ class App(tk.Tk):
 
         self._run("Writing .strm files…", work, done)
 
+    def _cleanup_status(self, folder: Path, counts: object) -> str:
+        if not isinstance(counts, dict):
+            return f"Cleaned up {folder}."
+        moved = int(counts.get("moved") or 0)
+        removed = int(counts.get("removed") or 0)
+        folders = int(counts.get("folders") or 0)
+        if moved == 0 and removed == 0 and folders == 0:
+            return f"The folder already matches the playlists. Nothing was removed from {folder}."
+        parts: list[str] = []
+        if moved:
+            parts.append(f"moved {moved:,}")
+        if removed:
+            parts.append(f"removed {removed:,}")
+        if folders == 1:
+            parts.append("deleted 1 empty folder")
+        elif folders:
+            parts.append(f"deleted {folders:,} empty folders")
+        summary = ", ".join(parts)
+        return summary[0].upper() + summary[1:] + f" in {folder}."
+
+    def clean_folders(self) -> None:
+        if self._busy or self._auto_running or self._auto_queue:
+            return
+        if not self.planned:
+            self._set_error("Load a playlist first.")
+            return
+        try:
+            folder = self._out_path()
+            if folder is None:
+                return
+        except BaseException as exc:
+            self._set_error(explain(exc))
+            return
+        message = (
+            f"Clean up the folders in\n{folder}?\n\n"
+            ".strm files that are no longer in the loaded playlists are deleted. "
+            "Files that stay are moved into the current folders. "
+            "Empty folders are removed. Other files are left alone."
+        )
+        if self.library is None:
+            message += (
+                "\n\nNo Emby library is loaded, so files still in the playlists are kept "
+                "even when Emby already has them."
+            )
+        else:
+            message += "\n\nFiles the plan leaves out because they are already in Emby are deleted too."
+        if not messagebox.askyesno("Clean up folders", message, parent=self):
+            return
+        planned = list(self.planned)
+
+        def work():
+            folder.mkdir(parents=True, exist_ok=True)
+            return self.cleaner.cleanup_folder(folder, planned, True)
+
+        def done(result) -> None:
+            self._set_error("")
+            self.status.set(self._cleanup_status(folder, result))
+
+        self._run("Cleaning up folders…", work, done)
+
     def save_report(self) -> None:
         if not self.planned:
             self._set_error("Load a playlist first.")
@@ -3549,6 +3617,7 @@ def self_check() -> None:
         assert app._wheel_pending == 0
         app.link_list.delete(0, "end")
         assert app._buttons[0].cget("text") == "Run"
+        assert any(button.cget("text") == "Clean up folders" for button in app._buttons)
         app.load_sample()
         app.show_plan()
         app.update()

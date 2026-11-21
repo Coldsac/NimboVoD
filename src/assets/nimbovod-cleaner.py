@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -237,7 +238,8 @@ def relative_path(entry: dict, layout: str, strip: bool, extra: re.Pattern[str] 
                 else f"{show} - S{season:02d}E{number:02d}"
             )
             return f"TV/{safe_segment(show)}/Season {season:02d}/{safe_segment(label)}.strm"
-        return f"Movies/{safe_segment(title)}.strm"
+        name = safe_segment(title)
+        return f"Movies/{name}/{name}.strm"
     return f"{safe_segment(entry.get('group') or 'Ungrouped')}/{safe_segment(title)}.strm"
 
 
@@ -763,15 +765,58 @@ def strm_text(path: Path) -> str | None:
     return raw.decode("utf-8", errors="replace").strip()
 
 
+def remove_empty_parents(start: Path, root: Path) -> None:
+    """Remove start and its parents while they stay empty. The output folder stays."""
+    root = root.resolve()
+    current = start.resolve()
+    while current != root:
+        try:
+            current.relative_to(root)
+        except ValueError:
+            return
+        if current.is_symlink():
+            return
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def remove_empty_dirs(root: Path) -> int:
+    """Remove every empty folder under root. The output folder itself stays."""
+    removed = 0
+    root = root.resolve()
+    for dirpath, dirnames, _filenames in os.walk(root, topdown=False):
+        current = Path(dirpath)
+        if current.resolve() == root or current.is_symlink():
+            continue
+        kept = []
+        for name in dirnames:
+            child = current / name
+            if not child.is_symlink():
+                kept.append(name)
+        dirnames[:] = kept
+        try:
+            current.rmdir()
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
 def write_plan(out: Path, planned: list[dict], apply: bool, on_progress=None) -> dict[str, int]:
     """Add missing .strm files, replace changed addresses, and delete planned drops.
 
     A file whose text already matches the planned URL is left untouched. A path
-    that a keep row writes is never deleted. Files that are not in the plan are
-    not scanned and not removed. apply=False counts the same actions and writes
-    nothing. on_progress, when set, is called as on_progress(done, total).
+    that a keep row writes is never deleted. Deleting a file also removes the
+    empty folders above it, and the output folder itself stays. Files that are
+    not in the plan are not scanned and not removed. apply=False counts the
+    same actions and writes nothing. on_progress, when set, is called as
+    on_progress(done, total).
     """
     counts = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0}
+    root = out.resolve()
     kept_paths = {row["path"].replace("\\", "/").lower() for row in planned if row["disposition"] == "keep"}
     total = len(planned)
     reported = 0.0
@@ -810,6 +855,7 @@ def write_plan(out: Path, planned: list[dict], apply: bool, on_progress=None) ->
             counts["removed"] += 1
             if apply:
                 target.unlink()
+                remove_empty_parents(target.parent, root)
             print(f"{'deleted' if apply else 'would delete'}  {row['path']}  ({row['reason']})")
         report(index)
     kept = sum(1 for row in planned if row["disposition"] == "keep")
@@ -832,6 +878,72 @@ def write_plan(out: Path, planned: list[dict], apply: bool, on_progress=None) ->
             f"Added {counts['added']}, updated {counts['updated']}, "
             f"left {counts['unchanged']} unchanged, removed {counts['removed']} under {out}"
         )
+    return counts
+
+
+def cleanup_folder(out: Path, planned: list[dict], apply: bool) -> dict[str, int]:
+    """Move kept streams into their planned folders and delete .strm files that are not kept.
+
+    A file already at a keep path stays, even when its address is old. A file
+    whose address matches a keep path is moved there. Every other .strm file is
+    deleted. Empty folders are then removed. Files that are not .strm files stay.
+    apply=False counts the file actions and changes nothing.
+    """
+    counts = {"moved": 0, "removed": 0, "folders": 0}
+    root = out.resolve()
+    if not root.is_dir():
+        return counts
+    keep_paths: dict[str, str] = {}
+    keep_urls: dict[str, str] = {}
+    for row in planned:
+        if row.get("disposition") != "keep":
+            continue
+        path = str(row.get("path", "")).replace("\\", "/")
+        if not path:
+            continue
+        keep_paths.setdefault(path.lower(), path)
+        url = str(row.get("url", "")).strip()
+        if url:
+            keep_urls.setdefault(url, path)
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            if name.lower().endswith(".strm"):
+                files.append(current / name)
+    for path in files:
+        try:
+            relative = path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if path.is_symlink() or relative.lower() in keep_paths:
+            continue
+        current = strm_text(path)
+        planned_path = keep_urls.get(current or "")
+        if planned_path:
+            dest = inside(root, planned_path)
+            try:
+                same = dest.resolve() == path.resolve()
+            except OSError:
+                same = False
+            if same:
+                continue
+            if dest.exists():
+                counts["removed"] += 1
+                if apply:
+                    path.unlink()
+            else:
+                counts["moved"] += 1
+                if apply:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(path), str(dest))
+            continue
+        counts["removed"] += 1
+        if apply:
+            path.unlink()
+    if apply:
+        counts["folders"] = remove_empty_dirs(root)
     return counts
 
 
@@ -1031,7 +1143,7 @@ def self_test() -> None:
         {"layout": "library", "strip_quality": True, "use_years": True, "match_filenames": True},
     )
     assert beast_plan[0]["disposition"] == "drop", beast_plan[0]
-    assert beast_plan[0]["path"] == "Movies/Heart Of The Beast (2026).strm"
+    assert beast_plan[0]["path"] == "Movies/Heart Of The Beast (2026)/Heart Of The Beast (2026).strm"
     assert normalize_title("Movie Megusta")[0] == "movie"
     copies = parse_m3u(
         "#EXTM3U\n"
@@ -1102,6 +1214,54 @@ def self_test() -> None:
         assert again == {"added": 0, "updated": 0, "unchanged": 4, "removed": 0}, again
         assert (folder / "A.strm").read_bytes() == matching
         assert (folder / "Other.strm").read_bytes() == other
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        movie = folder / "Movies" / "Dune (1984)"
+        movie.mkdir(parents=True)
+        (movie / "Dune (1984).strm").write_text("https://example.com/dune\n", encoding="utf-8")
+        season = folder / "TV" / "The Office" / "Season 01"
+        season.mkdir(parents=True)
+        (season / "The Office - S01E01.strm").write_text("https://example.com/office\n", encoding="utf-8")
+        stay = folder / "Movies" / "Blade Runner 2049"
+        stay.mkdir(parents=True)
+        (stay / "Blade Runner 2049.strm").write_text("https://example.com/blade\n", encoding="utf-8")
+        (folder / "note.txt").write_text("keep", encoding="utf-8")
+        removed = write_plan(
+            folder,
+            [
+                {"path": "Movies/Dune (1984)/Dune (1984).strm", "url": "https://example.com/dune", "disposition": "drop", "reason": "Already in Emby"},
+                {"path": "TV/The Office/Season 01/The Office - S01E01.strm", "url": "https://example.com/office", "disposition": "drop", "reason": "Already in Emby"},
+                {"path": "Movies/Blade Runner 2049/Blade Runner 2049.strm", "url": "https://example.com/blade", "disposition": "keep", "reason": ""},
+            ],
+            True,
+        )
+        assert removed["removed"] == 2, removed
+        assert not movie.exists()
+        assert not (folder / "TV").exists()
+        assert (stay / "Blade Runner 2049.strm").is_file()
+        assert (folder / "Movies").is_dir()
+        assert (folder / "note.txt").read_text(encoding="utf-8") == "keep"
+        old = folder / "Movies" / "Arrival (2016).strm"
+        old.write_text("https://example.com/arrival\n", encoding="utf-8")
+        gone = folder / "Movies" / "Heat (1995)"
+        gone.mkdir()
+        (gone / "Heat (1995).strm").write_text("https://example.com/heat\n", encoding="utf-8")
+        (folder / "poster.jpg").write_text("picture", encoding="utf-8")
+        plan = [
+            {"path": "Movies/Arrival (2016)/Arrival (2016).strm", "url": "https://example.com/arrival", "disposition": "keep", "reason": ""},
+            {"path": "Movies/Blade Runner 2049/Blade Runner 2049.strm", "url": "https://example.com/blade", "disposition": "keep", "reason": ""},
+        ]
+        preview = cleanup_folder(folder, plan, False)
+        assert preview == {"moved": 1, "removed": 1, "folders": 0}, preview
+        assert old.is_file() and gone.is_dir()
+        cleaned = cleanup_folder(folder, plan, True)
+        assert cleaned == {"moved": 1, "removed": 1, "folders": 1}, cleaned
+        moved = folder / "Movies" / "Arrival (2016)" / "Arrival (2016).strm"
+        assert moved.read_text(encoding="utf-8").strip() == "https://example.com/arrival"
+        assert not old.exists()
+        assert not gone.exists()
+        assert (folder / "poster.jpg").read_text(encoding="utf-8") == "picture"
+        assert (stay / "Blade Runner 2049.strm").is_file()
     listed = library_rows(
         {
             "Items": [

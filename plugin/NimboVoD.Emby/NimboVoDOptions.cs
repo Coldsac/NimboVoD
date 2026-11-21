@@ -38,6 +38,7 @@ namespace NimboVoD.Emby
             LibraryIds = "";
             RefreshMinutes = 0;
             RunNow = false;
+            CleanFolders = false;
             LibraryChoices = new List<EditorSelectOption>();
             ShowRemovedTags = false;
             RemovedTags = "";
@@ -126,6 +127,10 @@ namespace NimboVoD.Emby
         [DisplayName("Run now")]
         [Description("Turn this on and press Save. Last result shows each step, then the counts. The box clears when the update starts.")]
         public bool RunNow { get; set; }
+
+        [DisplayName("Clean up folders")]
+        [Description("Turn this on and press Save. .strm files that are no longer in the playlists are deleted, files that stay are moved into the current folders, and empty folders are removed. The box clears when the clean up starts.")]
+        public bool CleanFolders { get; set; }
 
         public static string LayoutKey(StreamLayout layout)
         {

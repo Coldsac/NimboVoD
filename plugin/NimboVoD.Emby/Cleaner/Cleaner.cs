@@ -53,6 +53,13 @@ namespace NimboVoD.Cleaner
         public int Removed { get; set; }
     }
 
+    public sealed class CleanupCounts
+    {
+        public int Moved { get; set; }
+        public int Removed { get; set; }
+        public int Folders { get; set; }
+    }
+
     public static class Cleaner
     {
         public static readonly string[] QualityTags = new[]
@@ -368,11 +375,161 @@ namespace NimboVoD.Cleaner
                     if (apply)
                     {
                         File.Delete(target);
+                        RemoveEmptyParents(target, folder);
                     }
                 }
                 Report(onProgress, index + 1, total);
             }
             return counts;
+        }
+
+        public static CleanupCounts CleanupFolder(string folder, IReadOnlyList<PlanRow> planned, bool apply)
+        {
+            var counts = new CleanupCounts();
+            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            {
+                return counts;
+            }
+            var root = Path.GetFullPath(folder);
+            var prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var keepPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var keepUrls = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var row in planned)
+            {
+                if (row == null || row.Disposition != "keep" || string.IsNullOrWhiteSpace(row.Path))
+                {
+                    continue;
+                }
+                var slash = Slash(row.Path);
+                keepPaths.Add(slash);
+                var url = (row.Url ?? "").Trim();
+                if (url.Length > 0 && !keepUrls.ContainsKey(url))
+                {
+                    keepUrls[url] = slash;
+                }
+            }
+            var files = new List<string>();
+            foreach (var file in Directory.EnumerateFiles(root, "*.strm", SearchOption.AllDirectories))
+            {
+                files.Add(file);
+            }
+            foreach (var file in files)
+            {
+                var full = Path.GetFullPath(file);
+                if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                var relative = Slash(full.Substring(prefix.Length));
+                if (keepPaths.Contains(relative))
+                {
+                    continue;
+                }
+                string plannedPath;
+                var text = StrmText(file);
+                if (!string.IsNullOrEmpty(text) && keepUrls.TryGetValue(text, out plannedPath))
+                {
+                    var dest = Inside(root, plannedPath);
+                    if (string.Equals(Path.GetFullPath(dest), full, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    if (File.Exists(dest))
+                    {
+                        counts.Removed++;
+                        if (apply)
+                        {
+                            File.Delete(file);
+                        }
+                    }
+                    else
+                    {
+                        counts.Moved++;
+                        if (apply)
+                        {
+                            var parent = Path.GetDirectoryName(dest);
+                            if (!string.IsNullOrEmpty(parent))
+                            {
+                                Directory.CreateDirectory(parent);
+                            }
+                            File.Move(file, dest);
+                        }
+                    }
+                    continue;
+                }
+                counts.Removed++;
+                if (apply)
+                {
+                    File.Delete(file);
+                }
+            }
+            if (apply)
+            {
+                counts.Folders = RemoveEmptyDirectories(root);
+            }
+            return counts;
+        }
+
+        private static void RemoveEmptyParents(string start, string root)
+        {
+            var rootFull = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var current = Path.GetDirectoryName(start);
+            while (!string.IsNullOrEmpty(current))
+            {
+                var full = Path.GetFullPath(current).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (string.Equals(full, rootFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+                if (!full.StartsWith(rootFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+                try
+                {
+                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0 || HasEntries(current))
+                    {
+                        return;
+                    }
+                    Directory.Delete(current);
+                }
+                catch (Exception)
+                {
+                    return;
+                }
+                current = Path.GetDirectoryName(current);
+            }
+        }
+
+        private static int RemoveEmptyDirectories(string root)
+        {
+            var removed = 0;
+            var dirs = new List<string>(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+            dirs.Sort((left, right) => right.Length.CompareTo(left.Length));
+            foreach (var dir in dirs)
+            {
+                try
+                {
+                    if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0 || HasEntries(dir))
+                    {
+                        continue;
+                    }
+                    Directory.Delete(dir);
+                    removed++;
+                }
+                catch (Exception)
+                {
+                }
+            }
+            return removed;
+        }
+
+        private static bool HasEntries(string dir)
+        {
+            using (var entries = Directory.EnumerateFileSystemEntries(dir).GetEnumerator())
+            {
+                return entries.MoveNext();
+            }
         }
 
         public static bool DirectoryReachable(string path, int timeoutMs = 2000)
@@ -643,7 +800,8 @@ namespace NimboVoD.Cleaner
                         : show + " - S" + season.ToString("00") + "E" + number.ToString("00");
                     return "TV/" + SafeSegment(show) + "/Season " + season.ToString("00") + "/" + SafeSegment(label) + ".strm";
                 }
-                return "Movies/" + SafeSegment(title) + ".strm";
+                var name = SafeSegment(title);
+                return "Movies/" + name + "/" + name + ".strm";
             }
             var group = string.IsNullOrEmpty(entry.Group) ? "Ungrouped" : entry.Group;
             return SafeSegment(group) + "/" + SafeSegment(title) + ".strm";

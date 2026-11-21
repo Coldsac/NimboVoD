@@ -53,7 +53,12 @@ namespace NimboVoD.Emby
             };
         }
 
-        public async Task Execute(CancellationToken cancellationToken, IProgress<double> progress)
+        public Task Execute(CancellationToken cancellationToken, IProgress<double> progress)
+        {
+            return ExecuteManual(cancellationToken, progress, true, false);
+        }
+
+        public async Task ExecuteManual(CancellationToken cancellationToken, IProgress<double> progress, bool write, bool cleanFolders)
         {
             if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
             {
@@ -62,7 +67,7 @@ namespace NimboVoD.Emby
             }
             try
             {
-                await RunAsync(cancellationToken, progress ?? new Progress<double>()).ConfigureAwait(false);
+                await RunAsync(cancellationToken, progress ?? new Progress<double>(), write, cleanFolders).ConfigureAwait(false);
             }
             finally
             {
@@ -87,7 +92,7 @@ namespace NimboVoD.Emby
             return null;
         }
 
-        private async Task RunAsync(CancellationToken cancellationToken, IProgress<double> progress)
+        private async Task RunAsync(CancellationToken cancellationToken, IProgress<double> progress, bool write, bool cleanFolders)
         {
             var config = Plugin.Instance.CurrentOptions();
             var problem = StartProblem(config);
@@ -169,20 +174,35 @@ namespace NimboVoD.Emby
                 OutputFolder = config.OutputFolder,
             });
             progress.Report(70);
-            Remember("Writing the .strm folder.", pulledAt);
-            var counts = Planner.WritePlan(config.OutputFolder.Trim(), planned, true, (done, total) =>
-            {
-                if (total > 0)
-                {
-                    progress.Report(70 + (30.0 * done / total));
-                }
-            });
             var note = failures.Count == 0 ? "" : string.Join(" ", failures) + " ";
-            var result = note + "Added " + counts.Added.ToString("N0")
-                + ", updated " + counts.Updated.ToString("N0")
-                + ", left " + counts.Unchanged.ToString("N0")
-                + " unchanged, removed " + counts.Removed.ToString("N0")
-                + ".";
+            var result = "";
+            if (write)
+            {
+                Remember("Writing the .strm folder.", pulledAt);
+                var counts = Planner.WritePlan(config.OutputFolder.Trim(), planned, true, (done, total) =>
+                {
+                    if (total > 0)
+                    {
+                        progress.Report(70 + (25.0 * done / total));
+                    }
+                });
+                result = note + "Added " + counts.Added.ToString("N0")
+                    + ", updated " + counts.Updated.ToString("N0")
+                    + ", left " + counts.Unchanged.ToString("N0")
+                    + " unchanged, removed " + counts.Removed.ToString("N0")
+                    + ".";
+            }
+            if (cleanFolders)
+            {
+                Remember("Cleaning up the .strm folder.", pulledAt);
+                var cleaned = Planner.CleanupFolder(config.OutputFolder.Trim(), planned, true);
+                var folderWord = cleaned.Folders == 1 ? "empty folder" : "empty folders";
+                var cleanText = "Moved " + cleaned.Moved.ToString("N0")
+                    + ", removed " + cleaned.Removed.ToString("N0")
+                    + ", deleted " + cleaned.Folders.ToString("N0")
+                    + " " + folderWord + ".";
+                result = result.Length == 0 ? note + cleanText : result + " " + cleanText;
+            }
             Remember(result, pulledAt);
             _logger.Info("{0}", result);
             progress.Report(100);

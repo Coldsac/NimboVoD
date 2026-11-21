@@ -103,7 +103,7 @@ namespace NimboVoD.Cleaner.Tests
                 },
             }, Options("library"));
             Assert.Equal("drop", planned[0].Disposition);
-            Assert.Equal("Movies/Heart Of The Beast (2026).strm", planned[0].Path);
+            Assert.Equal("Movies/Heart Of The Beast (2026)/Heart Of The Beast (2026).strm", planned[0].Path);
         }
 
         [Fact]
@@ -203,6 +203,68 @@ namespace NimboVoD.Cleaner.Tests
                 Assert.Equal(0, again.Updated);
                 Assert.Equal(4, again.Unchanged);
                 Assert.Equal(0, again.Removed);
+            }
+            finally
+            {
+                Directory.Delete(directory, true);
+            }
+        }
+
+        [Fact]
+        public void DeletingAStreamRemovesItsEmptyFoldersAndCleanupMovesTheRest()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "nimbovod-clean-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            try
+            {
+                var movie = Path.Combine(directory, "Movies", "Dune (1984)");
+                Directory.CreateDirectory(movie);
+                File.WriteAllText(Path.Combine(movie, "Dune (1984).strm"), "https://example.com/dune\n");
+                var season = Path.Combine(directory, "TV", "The Office", "Season 01");
+                Directory.CreateDirectory(season);
+                File.WriteAllText(Path.Combine(season, "The Office - S01E01.strm"), "https://example.com/office\n");
+                var stay = Path.Combine(directory, "Movies", "Blade Runner 2049");
+                Directory.CreateDirectory(stay);
+                File.WriteAllText(Path.Combine(stay, "Blade Runner 2049.strm"), "https://example.com/blade\n");
+                File.WriteAllText(Path.Combine(directory, "note.txt"), "keep");
+                var removed = Cleaner.WritePlan(directory, new[]
+                {
+                    Row("Movies/Dune (1984)/Dune (1984).strm", "https://example.com/dune", "drop", "Already in Emby"),
+                    Row("TV/The Office/Season 01/The Office - S01E01.strm", "https://example.com/office", "drop", "Already in Emby"),
+                    Row("Movies/Blade Runner 2049/Blade Runner 2049.strm", "https://example.com/blade", "keep"),
+                }, true, null);
+                Assert.Equal(2, removed.Removed);
+                Assert.False(Directory.Exists(movie));
+                Assert.False(Directory.Exists(Path.Combine(directory, "TV")));
+                Assert.True(File.Exists(Path.Combine(stay, "Blade Runner 2049.strm")));
+                Assert.True(Directory.Exists(Path.Combine(directory, "Movies")));
+                Assert.Equal("keep", File.ReadAllText(Path.Combine(directory, "note.txt")));
+
+                var old = Path.Combine(directory, "Movies", "Arrival (2016).strm");
+                File.WriteAllText(old, "https://example.com/arrival\n");
+                var gone = Path.Combine(directory, "Movies", "Heat (1995)");
+                Directory.CreateDirectory(gone);
+                File.WriteAllText(Path.Combine(gone, "Heat (1995).strm"), "https://example.com/heat\n");
+                File.WriteAllText(Path.Combine(directory, "poster.jpg"), "picture");
+                var plan = new[]
+                {
+                    Row("Movies/Arrival (2016)/Arrival (2016).strm", "https://example.com/arrival", "keep"),
+                    Row("Movies/Blade Runner 2049/Blade Runner 2049.strm", "https://example.com/blade", "keep"),
+                };
+                var preview = Cleaner.CleanupFolder(directory, plan, false);
+                Assert.Equal(1, preview.Moved);
+                Assert.Equal(1, preview.Removed);
+                Assert.Equal(0, preview.Folders);
+                Assert.True(File.Exists(old));
+                var cleaned = Cleaner.CleanupFolder(directory, plan, true);
+                Assert.Equal(1, cleaned.Moved);
+                Assert.Equal(1, cleaned.Removed);
+                Assert.Equal(1, cleaned.Folders);
+                var moved = Path.Combine(directory, "Movies", "Arrival (2016)", "Arrival (2016).strm");
+                Assert.Equal("https://example.com/arrival", File.ReadAllText(moved).Trim());
+                Assert.False(File.Exists(old));
+                Assert.False(Directory.Exists(gone));
+                Assert.Equal("picture", File.ReadAllText(Path.Combine(directory, "poster.jpg")));
             }
             finally
             {
