@@ -1,170 +1,135 @@
 <p align="center">
-  <img src="docs/images/mark.png" width="88" alt="NimboVoD">
+  <img src="docs/images/mark.svg" width="72" alt="NimboVoD">
 </p>
 
 <h1 align="center">NimboVoD</h1>
 
 <p align="center">
-  Turn M3U playlists into a folder of <code>.strm</code> files,<br>
-  and leave out anything already in your Emby library.
+  Playlists in. <code>.strm</code> files out.<br>
+  Anything already in your Emby library is left out.
 </p>
 
 <p align="center">
-  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/v1.15"><strong>Standalone v1.15</strong></a>
-  ·
-  <a href="https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.8"><strong>Emby plugin 1.1.8</strong></a><br>
-  Windows 10 or newer · 64-bit program · server plugin
+  <img src="docs/images/hero.png" alt="NimboVoD. Playlists in. Stream files out. Anything already in your Emby library is left out." width="100%">
 </p>
 
-NimboVoD runs in two ways. **Standalone** is a window on your PC. The **Emby plugin** runs inside the server. Both load M3U playlists, leave out anything already in the Emby library, and update a folder of `.strm` files. Each one keeps its own settings.
+NimboVoD reads M3U playlists, compares every stream with your Emby library, and keeps a folder of `.strm` files for what you do not already own. A `.strm` file is one line: the stream address. Point an Emby library at that folder and the new streams show up beside the rest of your media.
 
-Standalone uses a home-network address such as `http://192.168.1.20:8096` and an API key. Windows may say it protected your PC because `nimbovod.exe` is not signed. Choose **More info**, then **Run anyway**. The [Standalone v1.15](https://github.com/Coldsac/NimboVoD/releases/tag/v1.15) release is the latest Windows download.
+The same rules run in two places. The desktop app is for the machine in front of you. The Emby plugin runs on the server and reads the library directly.
 
 <p align="center">
-  <img src="docs/images/steps.png" width="760" alt="Three steps: load playlists, compare with Emby, write the folder">
+  <img src="docs/images/flow.png" alt="One run: load playlists, read Emby, plan, then write the strm folder." width="100%">
 </p>
 
-The pictures below are the Standalone window. They use example playlist links, a stand-in server address, and the built-in sample playlist.
+1. **Load playlists.** Each link is downloaded and each local file is read. One playlist can fail. The others still load. A playlist over 80 MB is refused.
+2. **Read Emby.** Movies, shows, and episodes are collected from the libraries you choose. A file that already ends in `.strm` is skipped, so NimboVoD does not treat its own copies as something you own.
+3. **Plan.** Every stream becomes a row: a file path, and either **New** or **Leave out**, with the reason.
+4. **Write.** Missing `.strm` files are added. A file whose address changed is replaced. A file that already matches is left untouched. A planned drop that is sitting in the folder is deleted.
+
+## The window
+
+The desktop app is a dark window with five tabs: Playlists, File names, Emby, Output, and Settings. **Run** does the whole pass: playlists, then the Emby library, then the folder.
 
 <p align="center">
-  <img src="docs/images/playlists.png" width="680" alt="Playlists tab with two M3U links, a loaded sample, and the Movies and TV layout">
+  <img src="docs/images/window.png" alt="The NimboVoD window on the Playlists tab, with Movies and TV layout selected." width="920">
 </p>
 
-## Standalone
+| Tab | What you do there |
+| --- | --- |
+| Playlists | Add M3U links or local files, load them, and choose a folder layout. |
+| File names | Strip quality tags, add your own tags, and drop duplicate `.strm` names. |
+| Emby | Server address, API key, the libraries to compare, or a pasted list of titles. |
+| Output | Save folder, write the files, open the plan, or save a text report. |
+| Settings | Start with Windows, repeat on a timer, and clean the folder. |
 
-The window opens on **Playlists**. The other tabs are **File names**, **Emby**, **Output**, and **Settings**.
+**Write .strm files** asks before it changes the folder. A timer that includes the folder update does the same write without asking again. The first automatic pass waits one minute after the app opens, so the network and the save folder have time to show up. After that, the interval you set repeats the checked steps. Blank means once. The shortest repeat is one minute. The longest is seven days.
 
-**Run** is at the top of the window. It loads the saved playlists, pulls Emby, then updates the `.strm` folder, in that order. It starts immediately. A failed playlist or Emby pull skips the folder write. **Load playlists**, **Pull library**, and **Write .strm files** still do one step at a time. **Write .strm files** asks before it changes the folder.
+Settings live in `%LOCALAPPDATA%\NimboVoD\settings.json`.
 
-Minimizing the window hides NimboVoD in the notification area. Click the icon to open it again. Right-click the icon and choose **Exit** to quit. The title-bar close button quits.
+## The plan
 
-### Playlists
-
-Add M3U links or choose local `.m3u` files, then click **Load playlists**. The same stream URL is kept once.
-
-**Folder layout**
-
-- **By group** puts each group-title in its own folder.
-- **Flat** puts every file in one folder.
-- **Movies & TV** uses `Movies/Name (Year)/Name (Year).strm` for movies and `TV/Show/Season 01/` for episodes.
-
-### File names
+Open **View plan** before a write. This is a small library and eight streams, with Movies & TV layout, quality tags stripped, and years used for movies.
 
 <p align="center">
-  <img src="docs/images/names.png" width="680" alt="File names tab with quality tags, extra tags, and duplicate removal">
+  <img src="docs/images/plan.png" alt="Plan for eight streams: three new files, five left out." width="100%">
 </p>
 
-**Strip quality tags from file names** is on by default. It removes tags such as `1080p`, `x265`, `[WEB]`, `[10BIT]`, `5.1`, `7.1`, `-LAMA`, and `-WORLD`. The full list is shown in the window. **Also strip these tags** removes extra words you type, both from file names and when matching Emby.
+*Dune (1984)* stays because the library has *Dune (2021)*. *Dune (2021) 1080p* is left out, and the `1080p` never reaches the file name. *The Office* season 1 is left out because a real episode of that season is already in Emby. Season 2 is new. The second copy of *The Matrix* is the same stream address, so it is kept once. *City News* has no episode pattern, so Movies & TV places it under `Movies/`.
 
-**Remove duplicate .strm files** is on by default. The first stream that cleans up to the same file is kept. Later copies are left out, and numbered files already in the folder, such as `Name (2).strm`, are removed.
-
-### Emby
+## Folder layouts
 
 <p align="center">
-  <img src="docs/images/emby.png" width="680" alt="Emby tab with a server address, selected libraries, and pasted titles">
+  <img src="docs/images/layouts.png" alt="Movies and TV, by group, and flat layouts for the same three streams." width="100%">
 </p>
 
-Enter the server address and API key, then click **Pull library**. User id is optional.
+Quality tags such as `1080p`, `WEBRip`, `x265`, `5.1`, and release suffixes such as `-LAMA` come off the file name when stripping is on. Add more tags under **Also strip these tags**, one per line or separated by commas. Two different addresses that clean up to the same file are kept once. Turn that off and the second file is named `Title (2).strm`. A numbered leftover already in the folder, next to the plain name, is removed with the duplicates.
 
-Click **Load libraries** and uncheck any library that should be left out of the comparison. Until that list is loaded, every library is read. A library discovered on a later load stays unchecked until you select it.
+## What gets left out
 
-You can also upload a library export or paste titles, one per line.
+Titles are compared after cleanup: lower case, punctuation removed, `&` read as "and", a leading "the", "a", or "an" dropped, and the last year in the name kept.
 
-A season Emby already has as real video is left out entirely. A season Emby does not have is still added. An existing `.strm` file does not count as the library. A title such as `Show S01E02` matches that season. A subtitle after a colon, such as `Show: Other Name`, can match `Show` when that is the name Emby uses. When Emby already has the full name as its own series, that series is matched on its own.
+| Stream | Left out when |
+| --- | --- |
+| Movie | The cleaned title matches a movie or a show. If both sides have a year, the years must match. |
+| Episode (`Show S01E03` or `Show 1x03`) | That episode is in Emby as a real video file, or any real episode of that season already exists. |
+| Same address twice | The second copy. One stream is enough. |
+| Same file name twice | The second copy, when duplicate `.strm` names are being removed. |
 
-### Plan
+A show is tried three ways: the full name, the part before a colon or a pipe, then the name with a trailing "Season N" removed. File-name matching is a last resort for movies: the library file's name, without its extension, is compared the same way. Year matching and file-name matching stay on in the desktop app unless `useYears` or `matchFilenames` is set to false in `settings.json`. The plugin has switches for both.
 
-<p align="center">
-  <img src="docs/images/plan.png" width="720" alt="Plan window showing new files and titles left out because they are already in Emby">
-</p>
+## Writing and cleaning up
 
-**View plan** opens this list. **New** is a file that will be written. **Leave out** is a title the plan skips. Filter the list or search it. With no playlist loaded, the button asks you to load one.
+A write only touches paths that are in the plan.
 
-### Output
+| Count | Meaning |
+| --- | --- |
+| Added | The `.strm` file was missing. |
+| Updated | The file was there, and the address changed. |
+| Unchanged | The file already contained that address. |
+| Removed | A planned drop was deleted, and empty folders above it were removed. |
 
-<p align="center">
-  <img src="docs/images/output.png" width="680" alt="Output tab with a save folder and Write, View plan, and Save report">
-</p>
+Files that are not part of the plan stay where they are. The save folder itself stays.
 
-Choose the save folder.
-
-- **Write .strm files** asks before it changes the folder. It adds new files and replaces a file whose address changed. A file whose text already matches is left as it is. A file the plan leaves out is removed only when that path is part of the plan. Removing that file also removes the empty folders above it. The save folder itself stays. Other files in the folder stay.
-- **Save report** writes the plan to a text file.
-
-### Settings
-
-<p align="center">
-  <img src="docs/images/settings.png" width="680" alt="Settings tab with automatic playlist and Emby refresh every 360 minutes">
-</p>
-
-The options in that picture are an example. They start off, and **Refresh every** starts blank.
-
-- **Run NimboVoD when Windows starts** opens the program when you sign in. It uses your account and does not need administrator rights. This is available in the downloaded program.
-- **Automatically pull the M3U playlists** reloads the saved links and local playlist files.
-- **Automatically pull the Emby library** reads Emby with the saved address and API key.
-- **Automatically update the .strm folder** adds new `.strm` files and removes ones the plan leaves out. That step does not ask again.
-
-**Run** does that full update immediately and does not use these checkboxes. Checked steps wait one minute after the program opens, then run one at a time: playlists, then Emby, then the `.strm` folder. A failed playlist or Emby pull skips the folder write. **Refresh every** repeats the checked steps after that many minutes, without the extra startup minute. Leave it blank to run only that first update. One minute is the shortest interval. Seven days is the longest. After the playlists load, the bottom of the window shows when they were last pulled. That time stays until the next successful pull.
-
-**Check for updates** reads the [GitHub releases](https://github.com/Coldsac/NimboVoD/releases) and shows a newer Standalone version. **Open release page** opens that release so you can download it. The plugin release is separate.
-
-**Clean up folders** asks before it changes the folder. It deletes `.strm` files that are no longer in the loaded playlists, moves the ones that stay into the current folders, and removes folders left empty. Files that are not `.strm` files stay. Load a playlist first. When an Emby library is loaded, files the plan leaves out are removed too.
-
-## Settings file
-
-Standalone settings, including the API key, are saved in plain text at `%LOCALAPPDATA%\NimboVoD\settings.json`. The plugin keeps its own settings on the server. `nimbovod.exe` is not stored in git. Download Standalone from the release above.
-
-## Build
-
-On 64-bit Windows, from this repository, with Python 3.12:
-
-```
-py -3.12 -m pip install pyinstaller
-py -3.12 -m PyInstaller --noconfirm --clean --windowed --onefile --name nimbovod --distpath dist --add-data "src/assets/nimbovod-cleaner.py;." src/assets/nimbovod_gui.py
-copy dist\nimbovod.exe nimbovod.exe
-```
-
-## Command line
-
-`src/assets/nimbovod-cleaner.py` is the same cleaner the window uses. Without `--apply` it only prints the plan.
-
-```
-py -3.12 src/assets/nimbovod-cleaner.py --m3u https://example.com/a.m3u --out "D:\Media\strm" --emby http://192.168.1.20:8096 --api-key KEY --apply
-```
-
-`--layout` is `group`, `flat`, or `library`. `--keep-quality` leaves quality tags in file names. `--strip-tag YTS` removes an extra tag. `--keep-duplicate-strm` keeps a second file when two streams clean up to the same name.
+**Clean up folders** is a second pass over every `.strm` file in the save folder. A file whose address matches a kept stream is moved into that stream's folder. Every other `.strm` file is deleted. Pictures, notes, and other files stay. Empty folders are removed afterward. The desktop app asks before this pass. On the plugin, turn on **Clean up folders** and press Save.
 
 ## Emby plugin
 
-The plugin does the same playlist update from inside Emby. It reads that server's library in the server process, so the page has no server address and no API key. Playlist paths and the save folder are paths on that server. Installing it does not write `.strm` files.
+The plugin adds a NimboVoD page to the server menu. It uses the server's own library, so it does not need an API key. On startup it registers a scheduled task named NimboVoD. **Refresh every** is in minutes. `0` means the task runs only when you ask.
 
-Download [NimboVoD.Emby.dll](https://github.com/Coldsac/NimboVoD/releases/download/plugin-1.1.8/NimboVoD.Emby.dll) from the [plugin 1.1.8 release](https://github.com/Coldsac/NimboVoD/releases/tag/plugin-1.1.8). Copy only that file into the server plugins folder. On Windows that folder is usually `%AppData%\Emby-Server\programdata\plugins` or `%ProgramData%\Emby-Server\programdata\plugins`. Leave every other build file out of that folder. Replace an older NimboVoD DLL if one is already there, then restart Emby.
+<p align="center">
+  <img src="docs/images/plugin.png" alt="The NimboVoD plugin page, with Movies and TV shows checked and Run now ready to save." width="920">
+</p>
 
-Open the server dashboard and choose **NimboVoD** in the server menu, or open **Plugins**, right-click NimboVoD, and choose **Settings**. Emby draws the page from the plugin.
+Turn on **Run now**, press Save, and the update starts. The checkbox clears, and **Last result** fills in as the run moves from playlists, to the library, to the folder. The line at the end is the counts: added, updated, unchanged, removed.
 
-- **M3U links** takes one link per line.
-- **Local M3U Files** takes one full path per line.
-- **Browse for an M3U file** opens this server's folders. Press **Save** to add the file to Local M3U Files.
-- **Save folder** is where the `.strm` files are written. Files that are not part of the plan are left alone.
-- **Folder layout** is **Movies and TV**, **By group**, or **Flat**. Movies and TV is the same layout as Standalone's Movies & TV.
-- **Strip quality tags from file names** is on by default. Turn on **View tags being removed** to show the built-in tags, then any extra tags already saved.
-- **Also strip these tags** takes one tag per line or separated by commas.
-- **Use years when matching movies** and **Match file names** start on.
-- **Remove duplicate .strm files** starts on.
-- **Read every library** starts off. **Libraries** lists the libraries on this server. Check the ones to compare. With the box off and nothing checked, the update stops and **Last result** asks you to select at least one library.
-- **Refresh every** is in minutes. `0` runs only when you use **Run now**. One minute is the shortest interval. Seven days is the longest.
-- **Run now** starts one update when you press **Save**. The box clears when the update starts.
-- **Clean up folders** starts one clean up when you press **Save**. `.strm` files that are no longer in the playlists are deleted, files that stay are moved into the current folders, and empty folders are removed. The box clears when the clean up starts.
+Plugin 1.1.8. Built for Emby 4.8.11.
 
-**Last result** shows the step in progress: **Run started.** or **Clean up started.**, **Loading playlists.**, **Reading the Emby library.**, **Writing the .strm folder.**, **Cleaning up the .strm folder.**, then the counts. Reopen the page to see the latest line. A missing playlist, save folder, or library check is written there, and the folder is not changed. If every playlist fails, or Emby returns nothing to compare, the folder is left as it is. A failed playlist with another playlist that loaded still updates the folder and puts the failure in **Last result**.
+## Command line
 
-Matching follows Standalone. A season already in Emby as real video is left out. A season it does not have is still added. An existing `.strm` file does not count as the library. A run adds new files, replaces a file whose address changed, and removes a planned file the library already has. Removing that file also removes the empty folders above it.
+`nimbovod-cleaner.exe` is the same planner without the window. With no flags it looks for `nimbovod.config.json` beside the program, in the current folder, or in `NIMBOVOD_HOME`. A run with no `--apply` prints the plan and writes nothing.
 
-The plugin version is 1.1.8. Standalone is 1.15.
+```text
+nimbovod-cleaner.exe
+nimbovod-cleaner.exe --apply
 
-Build the plugin with the .NET 8 SDK, from this repository:
+python nimbovod-cleaner.py --m3u https://example.com/movies.m3u --m3u https://example.com/shows.m3u --out "D:\Media\NimboVoD" --layout library --apply
 
+python nimbovod-cleaner.py --emby http://192.168.1.20:8096 --api-key KEY --export library.json
 ```
-dotnet build plugin/NimboVoD.Emby/NimboVoD.Emby.csproj -c Release
-dotnet test plugin/NimboVoD.Core.Tests/NimboVoD.Core.Tests.csproj -c Release
-```
+
+| Flag | Effect |
+| --- | --- |
+| `--config` | JSON file with `m3u`, `out`, `emby`, `apiKey`, `userId`, `layout`, `stripQuality`, `useYears`, `matchFilenames`, `extraTags`, `dropDuplicateStrm`. |
+| `--m3u` | Playlist URL or local path. Repeat it for each playlist. |
+| `--out` | Folder for the `.strm` files. |
+| `--layout` | `library`, `group`, or `flat`. The default from a bare config is `group`. |
+| `--apply` | Write new files, replace changed addresses, and remove planned drops. |
+| `--ignore-years` | Match movie titles when the years differ. |
+| `--keep-quality` | Leave quality tags in the file names. |
+| `--keep-duplicate-strm` | Keep a second file when two streams clean up to the same name. |
+| `--strip-tag` | Extra tag to remove. Repeat the flag for each tag. |
+| `--export` | Save the Emby library as JSON and stop. |
+
+A home-network address such as `192.168.1.20` is fine. This program runs on your machine. The desktop library read stops at 500,000 items.
+
+The desktop app and the plugin share one set of matching rules. `plugin/NimboVoD.Core.Tests` locks the C# planner to the same cases the Python cleaner checks: titles, seasons, duplicate files, writes, and cleanup.
